@@ -7,7 +7,7 @@ APK's contents and Daggerfall's own data from your own copy.
  
 ## Install & run
  
-You need two things: the Daggerfall Unity Android APK (`dfu_il2cpp-64bit`), and
+You need two things: the Daggerfall Unity Android APK (`dfu_il2cpp-64bit-v1.1.1.9_mods-not-supported.apk`), and
 `ARENA2` from Daggerfall, which Bethesda gives away free.
  
 Put the `.nro` in **any** folder on the card and unpack the rest next to it. The
