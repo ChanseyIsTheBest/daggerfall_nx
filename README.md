@@ -16,12 +16,12 @@ loader finds its own folder at runtime, so the name and location are up to you:
 ```
 sdmc:/switch/daggerfall_nx
 ├── daggerfall_nx.nro
-├── libmain.so  libunity.so  libil2cpp.so  lib_burst_generated.so
-│                                          <- from the APK's lib/arm64-v8a/
+├── libmain.so
+├── libunity.so
+├── libil2cpp.so
+├── lib_burst_generated.so
 ├── assets/                                <- the APK's assets/ folder, ENTIRE
-│   ├── bin/                                  ~326 files, 74 MB
-│   ├── aa/  Text/  Fonts/  Quests/  Tables/  BIOGs/  SpellIcons/ ...
-└── arena2/                                <- Daggerfall's game data, 1680 files
+.└── arena2/                                <- Daggerfall's game data, 1680 files
 ```
  
 Launch from hbmenu, or by **title override** (hold R while starting an installed
