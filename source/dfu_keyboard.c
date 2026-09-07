@@ -182,6 +182,13 @@ void dfu_kbd_tick(void) {
   const int focused = dfu_kbd_textbox_focused();
   static int was_focused;
 
+  /* Stand down if Unity's own soft-input path is driving. sec 31 concluded
+   * Daggerfall never asks for a keyboard -- the log now shows
+   * UnityPlayer.showSoftInput being resolved and called, so that was wrong, and
+   * this hook has been a second mechanism competing with the engine's. Y still
+   * opens it by hand if the engine misses one. */
+  if (editbox_engine_drives()) { was_focused = focused; return; }
+
   if (focused && !was_focused) {           /* rising edge: a box just took focus */
     debugPrintf("[kbd] TextBox focused -> opening keyboard\n");
     /* Only consume the edge if the open actually ran. dfu_kbd_open() throttles

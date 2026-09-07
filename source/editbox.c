@@ -31,10 +31,27 @@ extern void kbd_push_result(const char *text, int cancelled);  /* jni_fake.c */
 
 static char g_editbox_text[EDITBOX_TEXT_CAP];
 static int  g_editbox_open;
+
+/* Launching a second library applet while one is already up takes the whole
+ * console down -- an Atmosphere-level crash, not a process one. `g_editbox_open`
+ * used to be guarded by a bare check-then-set, which is only safe if every
+ * caller is on the same thread, and they are not:
+ *
+ *   jni_fake.c   Unity's own showSoftInput path, on Unity's JNI thread
+ *   dfu_keyboard.c   the TextBox focus hook's auto-open, on the render thread
+ *
+ * Both can pass `if (g_editbox_open)` before either sets it. A TRY-lock, not a
+ * blocking one: a caller that loses the race must give up immediately, never
+ * queue a second keyboard behind the first. */
+static Mutex g_editbox_lock;
 static int  g_editbox_cancelled;
 
 void editbox_show(const char *initial, int maxlen) {
-  if (g_editbox_open) return;               /* already up: ignore re-entry */
+  if (!mutexTryLock(&g_editbox_lock)) {     /* someone else already has it */
+    debugPrintf("[kbd] editbox_show refused: a keyboard is already up "
+                "(second applet would crash the console)\n");
+    return;
+  }
   g_editbox_open = 1;
   g_editbox_cancelled = 1;                  /* assume cancel until confirmed */
 
@@ -59,6 +76,7 @@ void editbox_show(const char *initial, int maxlen) {
   }
 
   g_editbox_open = 0;
+  mutexUnlock(&g_editbox_lock);
   debugPrintf("[kbd] swkbd closed: cancelled=%d text=\"%s\"\n",
               g_editbox_cancelled, g_editbox_text);
   g_kbd_trace = 60;   /* the retrieval call is in the next few dozen */
@@ -68,6 +86,14 @@ void editbox_show(const char *initial, int maxlen) {
 }
 
 int editbox_is_open(void) { return g_editbox_open; }
+
+/* Set the first time UNITY'S OWN soft-input path opens the keyboard. Once the
+ * engine is driving, dfu_keyboard.c's TextBox auto-open must stand down: two
+ * mechanisms racing for one applet is what crashed the console, and the engine
+ * knows more about when a keyboard is wanted than a focus hook does. */
+static int g_editbox_engine_driven;
+void editbox_mark_engine_driven(void) { g_editbox_engine_driven = 1; }
+int  editbox_engine_drives(void)      { return g_editbox_engine_driven; }
 
 /* editbox_text() deliberately returns the SEEDED text on cancel, so callers
  * that just want "the current value" behave correctly. A caller that must

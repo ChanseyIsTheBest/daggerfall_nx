@@ -18,7 +18,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET    := daggerfall_nx
 APP_TITLE := Daggerfall Unity
 APP_AUTHOR := ChanseyIsTheBest
-APP_VERSION := v1.1.1.9s1
+APP_VERSION := v1.1.1.9s1.0.1
 # icon.jpg is the 256x256 JPEG elf2nro embeds in the NRO. Regenerate from any
 # source image with:  python3 tools/make_icon.py <image>
 # That crops to the largest centred square and rescales -- it never stretches.

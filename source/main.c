@@ -640,6 +640,29 @@ static int load_module(so_module *mod, const char *name) {
   heap_so_limit -= used;
   debugPrintf("[mod] %-14s virtbase=%p size=0x%zx  (resolve: addr - virtbase = vaddr)\n",
               name, mod->load_virtbase, mod->load_size);
+
+  /* Is this the build every offset in this port was derived from?
+   *
+   * Nothing else checks. Most hooks guard themselves and skip politely on a
+   * mismatch, but the 21 allocator patch sites in libunity are written
+   * unconditionally -- on the wrong build they corrupt 21 words of whatever is
+   * there and the process dies early somewhere unrelated. Reported crashes
+   * "very early, in places I never saw" are exactly that shape, so say so
+   * plainly instead of letting it happen. */
+  {
+    size_t want = 0;
+    if      (!strcmp(name, LIB_UNITY))  want = EXPECT_LIBUNITY_BYTES;
+    else if (!strcmp(name, LIB_IL2CPP)) want = EXPECT_LIBIL2CPP_BYTES;
+    if (want && mod->so_size != want) {
+      debugPrintf("[mod] !! %s is %zu bytes, expected %zu\n",
+                  name, (size_t)mod->so_size, want);
+      fatal_error("%s is not the build this port was made for.\n\n"
+                  "It is %zu bytes; this port needs %zu.\n\n"
+                  "Use the .so files from\n%s\n\n"
+                  "Every patch address comes from that exact APK.",
+                  name, (size_t)mod->so_size, want, EXPECT_APK_NAME);
+    }
+  }
   crx_resolve_imports(mod);   /* so_resolve(mod, dynlib_functions, ...) */
   /* NOTE: so_patch_stack_canaries() intentionally NOT called. Per-thread bionic
    * TLS (install_bionic_tls) makes the engine's stack-protector guard consistent,

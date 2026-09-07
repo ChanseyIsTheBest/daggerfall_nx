@@ -418,3 +418,33 @@
  *   KeyCode lastKeyCode;         // +0xAC   */
 #define DFU_UI_lastCharacterTyped   0xA8
 #define DFU_UI_lastKeyCode          0xAC
+
+
+/* ==========================================================================
+ * BUILD IDENTITY -- which APK these offsets were derived from
+ * ==========================================================================
+ *
+ * EVERY address in this header and in nx_patch_dfu.h was derived from one
+ * specific build of Daggerfall Unity. Point them at a different APK and they
+ * are not approximately right, they are meaningless.
+ *
+ * Most of the hooks guard themselves: a Time accessor, an Input method or a
+ * TextBox prologue that does not match its expected first word is skipped with
+ * a log line. THE 21 ALLOCATOR PATCH SITES IN libunity DO NOT. They are written
+ * unconditionally, because they were located by matching a constellation of
+ * instructions rather than by a single guard word -- so on the wrong build they
+ * scribble 21 words into whatever happens to live at those addresses, and the
+ * process dies early, somewhere unrelated, with nothing pointing back here.
+ *
+ * That is the failure a tester on the wrong APK gets, and it looks nothing like
+ * a version-mismatch message. Hence the size check at load: cheap, needs no ELF
+ * parsing, and two different builds are never the same number of bytes.
+ *
+ *   libunity.so   18,023,304 bytes   BuildID (xxHash) 1dc173bbf7a97f88
+ *   libil2cpp.so  73,037,032 bytes   BuildID (sha1)   cc72326d...a77f0cda
+ *
+ * From: dfu_il2cpp-64bit-v1_1_1_9_mods-not-supported.apk
+ * (Unity 2022.3.62f3, arm64-v8a, IL2CPP) */
+#define EXPECT_LIBUNITY_BYTES   18023304u
+#define EXPECT_LIBIL2CPP_BYTES  73037032u
+#define EXPECT_APK_NAME         "dfu_il2cpp-64bit-v1_1_1_9"

@@ -79,7 +79,10 @@ static fn_set_axis         g_set_axis;
 static fn_set_enabled      g_set_enabled;
 static fn_get_instance     g_get_instance;
 static fn_get_default_bind g_get_default_bind;
-static fn_trigger_action   g_trigger_action;
+/* TriggerAction is deliberately NOT resolved or called any more -- see the
+ * one-shot note in k_held[]. The offset and its guard word stay in the headers
+ * so verify_offsets.py keeps proving they are still correct, in case a future
+ * change ever needs it back. */
 
 static PadState g_pad;        /* initialised once in dfu_input_init   */
 static int  g_ready;          /* offsets guard-checked and resolved  */
@@ -143,7 +146,38 @@ static const uint8_t k_held[] = {
    * to come through a bound key like every other held action. */
   DFU_MoveForwards, DFU_MoveBackwards, DFU_MoveLeft, DFU_MoveRight,
   DFU_TurnLeft, DFU_TurnRight,
+  /* ONE-SHOT ACTIONS. These used to be delivered by calling
+   * TouchscreenInputManager.TriggerAction() -- a managed IL2CPP method invoked
+   * from this C frame. IL2CPP raises managed exceptions as C++, a C frame
+   * cannot catch one, so any throw out of TriggerAction ends the process with
+   *     terminating with uncaught exception of type Il2CppExceptionWrapper
+   * which is what pressing + on the main menu did. TriggerAction also starts a
+   * coroutine, so it does more work in that frame than a plain setter.
+   *
+   * They are keycode pulses now, exactly like the held actions: we set a bound
+   * key for one frame and Daggerfall's own InputManager reads it through the
+   * Input.GetKey hooks. Nothing calls into managed code, so nothing can throw
+   * across the boundary. */
+  DFU_Escape, DFU_Status, DFU_Inventory, DFU_CharacterSheet,
+  DFU_TravelMap, DFU_AutoMap, DFU_Rest, DFU_Transport,
+  DFU_UseMagicItem, DFU_SwitchHand, DFU_StealMode, DFU_GrabMode,
+  DFU_InfoMode, DFU_TalkMode, DFU_LogBook, DFU_NoteBook,
+  DFU_QuickSave, DFU_QuickLoad, DFU_ToggleConsole,
 };
+
+/* Keycodes pressed for exactly one frame. Cleared at the top of the next pump,
+ * after dfu_kc_frame_end() has latched them into prev -- which is what turns
+ * them into a single Input.GetKeyDown edge and then a GetKeyUp. */
+#define MAX_PULSE 8
+static int32_t g_pulse[MAX_PULSE];
+static int     g_pulse_n;
+
+static void pulse(int action) {
+  int32_t kc = g_bind[action];
+  if (!kc || g_pulse_n >= MAX_PULSE) return;
+  kc_set(kc, 1);
+  g_pulse[g_pulse_n++] = kc;
+}
 
 /* Drop EVERYTHING we are holding down.
  *
@@ -170,6 +204,7 @@ void dfu_input_release_all(void) {
       if (kc) g_set_key(kc, 0);
     }
   memset(g_key_last, 0, sizeof g_key_last);   /* see g_key_last: must not go stale */
+  g_pulse_n = 0;                              /* the table is clear; nothing to release */
   if (g_set_axis) {
     g_set_axis(DFU_AXIS_MovementHorizontal, 0.0f);
     g_set_axis(DFU_AXIS_MovementVertical,   0.0f);
@@ -205,8 +240,7 @@ void dfu_input_init(void) {
                  OFF_TSIM_SetAxis, GUARD_TSIM_SetAxis);
   ok &= guard_ok("TouchscreenInputManager.set_IsTouchscreenInputEnabled",
                  OFF_TSIM_set_InputEnabled, GUARD_TSIM_set_InputEnabled);
-  ok &= guard_ok("TouchscreenInputManager.TriggerAction",
-                 OFF_TSIM_TriggerAction, GUARD_TSIM_TriggerAction);
+  /* TriggerAction's guard is not checked here: nothing calls it. */
   ok &= guard_ok("InputManager.get_Instance",
                  OFF_InputManager_get_Instance, GUARD_IM_get_Instance);
   ok &= guard_ok("InputManager.GetDefaultBinding",
@@ -222,7 +256,6 @@ void dfu_input_init(void) {
   g_set_key          = (fn_set_key)(b + OFF_TSIM_SetKey);
   g_set_axis         = (fn_set_axis)(b + OFF_TSIM_SetAxis);
   g_set_enabled      = (fn_set_enabled)(b + OFF_TSIM_set_InputEnabled);
-  g_trigger_action   = (fn_trigger_action)(b + OFF_TSIM_TriggerAction);
   g_get_instance     = (fn_get_instance)(b + OFF_InputManager_get_Instance);
   g_get_default_bind = (fn_get_default_bind)(b + OFF_InputManager_GetDefaultBind);
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -321,6 +354,9 @@ void dfu_input_pump(void) {
    * GetKeyUp never fired either. Latching first leaves the edge visible for the
    * whole frame, which is what the game samples. */
   dfu_kc_frame_end();
+  /* Release last frame's one-shots AFTER the latch, so the game saw exactly one
+   * GetKeyDown frame and now sees the GetKeyUp. */
+  while (g_pulse_n) kc_set(g_pulse[--g_pulse_n], 0);
 
   padUpdate(&g_pad);
   uint64_t held = padGetButtons(&g_pad);
@@ -343,11 +379,16 @@ void dfu_input_pump(void) {
      * do_dpad is not gated on visibility), but that overlap predates this
      * change and has not been reported as a problem; noting it rather than
      * silently widening the fix. */
+    /* STICK ONLY. The D-pad used to walk as well, which collided with the four
+     * one-shot actions bound to it (Inventory / Character sheet / Travel map /
+     * Automap): every menu press also took a step. It was added while chasing
+     * "the sticks don't work", and the stick binding is what actually fixed
+     * that -- the D-pad half was never needed. */
     const int sx = cursor_owns ? 0 : ls.x, sy = cursor_owns ? 0 : ls.y;
-    int up    = (sy >  T) || (held & HidNpadButton_Up);
-    int down_ = (sy < -T) || (held & HidNpadButton_Down);
-    int left  = (sx < -T) || (held & HidNpadButton_Left);
-    int right = (sx >  T) || (held & HidNpadButton_Right);
+    int up    = (sy >  T);
+    int down_ = (sy < -T);
+    int left  = (sx < -T);
+    int right = (sx >  T);
     key(DFU_MoveForwards, up);   key(DFU_MoveBackwards, down_);
     key(DFU_MoveLeft,     left); key(DFU_MoveRight,     right);
   }
@@ -369,26 +410,29 @@ void dfu_input_pump(void) {
    * press/release coroutine, so re-firing it every frame while a button is
    * held would retrigger it continuously. */
   if (!mod) {
-    if (pressed & HidNpadButton_Up)    g_trigger_action(DFU_Inventory);
-    if (pressed & HidNpadButton_Down)  g_trigger_action(DFU_CharacterSheet);
-    if (pressed & HidNpadButton_Left)  g_trigger_action(DFU_TravelMap);
-    if (pressed & HidNpadButton_Right) g_trigger_action(DFU_AutoMap);
-    if (pressed & HidNpadButton_Plus)  g_trigger_action(DFU_Escape);
-    if (pressed & HidNpadButton_Minus) g_trigger_action(DFU_Status);
+    if (pressed & HidNpadButton_Up)    pulse(DFU_Inventory);
+    if (pressed & HidNpadButton_Down)  pulse(DFU_CharacterSheet);
+    if (pressed & HidNpadButton_Left)  pulse(DFU_TravelMap);
+    if (pressed & HidNpadButton_Right) pulse(DFU_AutoMap);
+    if (pressed & HidNpadButton_Plus)  pulse(DFU_Escape);
+    /* Minus toggles gyro pointing while the cursor is up (nx_pointer owns it
+     * then), so firing Status as well would do both on one press -- the same
+     * double-duty that A had. While the cursor is hidden it is Status. */
+    if ((pressed & HidNpadButton_Minus) && !cursor_owns) pulse(DFU_Status);
   } else {
-    if (pressed & HidNpadButton_B)      g_trigger_action(DFU_Rest);
-    if (pressed & HidNpadButton_A)      g_trigger_action(DFU_Transport);
-    if (pressed & HidNpadButton_X)      g_trigger_action(DFU_UseMagicItem);
-    if (pressed & HidNpadButton_Y)      g_trigger_action(DFU_SwitchHand);
-    if (pressed & HidNpadButton_Up)     g_trigger_action(DFU_StealMode);
-    if (pressed & HidNpadButton_Down)   g_trigger_action(DFU_GrabMode);
-    if (pressed & HidNpadButton_Left)   g_trigger_action(DFU_InfoMode);
-    if (pressed & HidNpadButton_Right)  g_trigger_action(DFU_TalkMode);
-    if (pressed & HidNpadButton_L)      g_trigger_action(DFU_LogBook);
-    if (pressed & HidNpadButton_R)      g_trigger_action(DFU_NoteBook);
-    if (pressed & HidNpadButton_Plus)   g_trigger_action(DFU_QuickSave);
-    if (pressed & HidNpadButton_Minus)  g_trigger_action(DFU_QuickLoad);
-    if (pressed & HidNpadButton_StickR) g_trigger_action(DFU_ToggleConsole);
+    if (pressed & HidNpadButton_B)      pulse(DFU_Rest);
+    if (pressed & HidNpadButton_A)      pulse(DFU_Transport);
+    if (pressed & HidNpadButton_X)      pulse(DFU_UseMagicItem);
+    if (pressed & HidNpadButton_Y)      pulse(DFU_SwitchHand);
+    if (pressed & HidNpadButton_Up)     pulse(DFU_StealMode);
+    if (pressed & HidNpadButton_Down)   pulse(DFU_GrabMode);
+    if (pressed & HidNpadButton_Left)   pulse(DFU_InfoMode);
+    if (pressed & HidNpadButton_Right)  pulse(DFU_TalkMode);
+    if (pressed & HidNpadButton_L)      pulse(DFU_LogBook);
+    if (pressed & HidNpadButton_R)      pulse(DFU_NoteBook);
+    if (pressed & HidNpadButton_Plus)   pulse(DFU_QuickSave);
+    if (pressed & HidNpadButton_Minus)  pulse(DFU_QuickLoad);
+    if (pressed & HidNpadButton_StickR) pulse(DFU_ToggleConsole);
   }
 
   /* Held actions need the KeyCode binding. If it has not resolved yet we skip

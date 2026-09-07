@@ -991,7 +991,7 @@ static void *act_object(const FakeID *id, va_list va) {
   /* A String-returning keyboard call: show it, then hand back what was typed.
    * This is the path this game uses -- it never polls a getter afterwards. */
   if (is_editbox_show(id->name) && sig_returns(id->sig, "Ljava/lang/String;")) {
-    editbox_show(first_string_arg(id->sig, va), 64);
+    editbox_mark_engine_driven(); editbox_show(first_string_arg(id->sig, va), 64);
     const char *t = editbox_text();
     debugPrintf("[kbd] show-returns-text %s.%s -> \"%s\"\n",
                 id->cls, id->name, t ? t : "");
@@ -1225,7 +1225,7 @@ static juint act_int(const FakeID *id, va_list va) {
   }
   if (is_editbox_open(id->name)) return (juint)editbox_is_open();
   // some builds expose Show/Open as an int (success) call rather than void
-  if (is_editbox_show(id->name)) { editbox_show(first_string_arg(id->sig, va), 32); return 1; }
+  if (is_editbox_show(id->name)) { editbox_mark_engine_driven(); editbox_show(first_string_arg(id->sig, va), 32); return 1; }
   // Play Asset Delivery: with NO Play Core on Switch, the engine MUST take the
   // "missing" path, where it treats every asset pack as install-time/local and
   // reads assets synchronously from the APK/bundle. Returning false (the old
@@ -1295,7 +1295,7 @@ static void act_void(const FakeID *id, va_list va) {
   if (name_has(id->name, "removeFrameCallback")) {
     mutexLock(&g_runq_lk); g_frame_cb = 0; mutexUnlock(&g_runq_lk); return;
   }
-  if (is_editbox_show(id->name)) { editbox_show(first_string_arg(id->sig, va), 64); return; }
+  if (is_editbox_show(id->name)) { editbox_mark_engine_driven(); editbox_show(first_string_arg(id->sig, va), 64); return; }
   if (is_editbox_close(id->name)) { editbox_close(); return; }
   kbd_sniff(id->cls, id->name);
   (void)va;

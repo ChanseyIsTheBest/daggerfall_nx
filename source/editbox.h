@@ -27,6 +27,11 @@ const char *editbox_text(void);
  * user retyping the same thing -- so check this before writing anything back. */
 int editbox_cancelled(void);
 
+/* Unity's own showSoftInput path drives the keyboard on this game; when it does,
+ * the TextBox auto-open in dfu_keyboard.c gets out of the way. */
+void editbox_mark_engine_driven(void);
+int  editbox_engine_drives(void);
+
 // engine asked to dismiss the box.
 void editbox_close(void);
 
