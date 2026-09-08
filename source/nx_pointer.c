@@ -42,12 +42,7 @@ static float s_touch_x[16], s_touch_y[16];
 static float s_cx, s_cy;
 static int   s_visible   = -1;      /* -1 = not yet decided */
 static int   s_was_docked = -1;
-static int   s_tap_prev  = 0;
-/* Taps are only live once every tap button has been seen released. File scope
- * rather than function-static because nxp_release_touch() must disarm too --
- * otherwise closing the keyboard applet with A still held would fire a fresh
- * DOWN the player never pressed. */
-static int   s_tap_armed = 0;       /* A or mouse-left held last frame */
+static int   s_tap_prev  = 0;       /* A or mouse-left held last frame */
 
 /* tunables, adjusted live */
 static float s_stick_speed;         /* px/frame at full stick deflection */
@@ -71,6 +66,7 @@ static int s_mouse_connected = 0;
 #define GYRO_GAIN 120.0f
 
 /* d-pad auto-repeat for the sensitivity adjustment */
+static int   s_dpad_hold = 0;
 
 /* Settings persistence. A save is queued whenever a sensitivity changes and
  * committed 3s after the LAST change, so holding the D-pad through twenty steps
@@ -161,11 +157,6 @@ void nxp_save_settings(void) {
 }
 
 /* Queue a save; it lands SETTINGS_DEBOUNCE_NS after the last change. */
-/* Only do_dpad() ever called this, to queue a save after a runtime sensitivity
- * change. With that binding removed nothing changes settings at runtime, so it
- * has no caller -- kept (and marked) rather than deleted, because settings_tick()
- * is still wired up and any future runtime setting will want exactly this. */
-static void settings_touch(void) __attribute__((unused));
 static void settings_touch(void) {
   s_settings_dirty = 1;
   s_settings_tick  = armGetSystemTick();
@@ -443,11 +434,42 @@ static void do_touch(void) {
  *   else                   -> stick speed
  * so it is never a no-op, and there is only ever one thing it can mean.
  * Auto-repeats while held. Any change queues a debounced save. */
-/* do_dpad() is GONE. Up/Down used to step the pointer sensitivity, but the
- * D-pad is a game input -- it walks the character and moves through menus -- so
- * every press was also nudging a setting, and the ~0.4s auto-repeat meant
- * holding a direction to walk quietly rewound the sensitivity. Sensitivity now
- * only changes through pointer.cfg, which is what that file is for. */
+static void do_dpad(u64 held, u64 pressed) {
+  const u64 any = HidNpadButton_Up | HidNpadButton_Down;
+
+  int repeat = 0;
+  if (held & any) {
+    s_dpad_hold++;
+    if (s_dpad_hold > 24 && (s_dpad_hold % 3) == 0) repeat = 1;   /* ~0.4s, then repeat */
+  } else {
+    s_dpad_hold = 0;
+  }
+
+  int step = 0;
+  if (pressed & HidNpadButton_Up)   step = +1;
+  if (pressed & HidNpadButton_Down) step = -1;
+  if (repeat && (held & HidNpadButton_Up))   step = +1;
+  if (repeat && (held & HidNpadButton_Down)) step = -1;
+  if (!step) return;
+
+  const float f = (step > 0) ? 1.15f : (1.0f / 1.15f);
+
+  if (s_mouse_connected) {
+    s_mouse_sens *= f;
+    clamp_settings();
+    logf_("nxp: mouse sensitivity = %.2f\n", s_mouse_sens);
+  } else if (s_gyro_on) {
+    s_gyro_sens *= f;
+    clamp_settings();
+    logf_("nxp: gyro sensitivity = %.2f\n", s_gyro_sens);
+  } else {
+    s_stick_speed *= f;
+    clamp_settings();
+    logf_("nxp: stick speed = %.1f px/frame\n", s_stick_speed);
+  }
+
+  settings_touch();                 /* save 3s after the last change */
+}
 
 /* Pick the six-axis handle that matches whatever is actually connected, then
  * read its latest sample. Handheld, Pro Controller and dual Joy-Con all report
@@ -568,22 +590,10 @@ static int do_mouse(void) {
     }
   }
 
-  /* No mouse -> nothing to report. hidGetMouseStates() returns a FULL ring of
-   * 16 stale samples even when nothing is plugged in, so `n > 0` is not
-   * presence and must not be treated as it. Without this the port logged
-   *     nxp: mouse detected (16 samples buffered)
-   * on a console with no mouse attached, every boot. */
-  if (!conn) { s_mouse_seen = newest; return 0; }
-
   if (s_mouse_seen == 0) {           /* first sight of the mouse: sync, don't jump */
     s_mouse_seen = newest;
     logf_("nxp: mouse detected (%d samples buffered)\n", n);
-    /* Return 0, NOT the buffered button state. This branch exists to SYNC --
-     * its own comment says "don't jump" -- and the samples it is syncing past
-     * are by definition ones we never processed. Handing back
-     * (buttons & Left) turns a stale queued click into a tap the player never
-     * made, at whatever position the cursor happens to occupy. */
-    return 0;
+    return (buttons & HidMouseButton_Left) ? 1 : 0;
   }
   s_mouse_seen = newest;
 
@@ -632,35 +642,10 @@ void nxp_update(void) {
   const u64 held    = padGetButtons(&s_pad);
   const u64 pressed = padGetButtonsDown(&s_pad);
 
-  /* ---- ZL + ZR toggles the virtual cursor -------------------------------
-   * '+' used to do this, but '+' is a GAME button now that the pad bridge is
-   * live -- Daggerfall has it bound, so toggling the cursor stole a keypress
-   * from the game every time.
-   *
-   * ZL+ZR is a chord no single game action uses, and it is edge-triggered on
-   * the SECOND of the two going down so holding either one alone does nothing.
-   * ZL and ZR individually stay available to the game and to the tap handler
-   * below. */
-  {
-    const u64 CHORD = HidNpadButton_ZL | HidNpadButton_ZR;
-    static int chord_latched = 0;
-    static unsigned chord_cool = 0;      /* frames until another toggle is allowed */
-    if (chord_cool) chord_cool--;
-    if ((held & CHORD) == CHORD) {
-      /* The latch alone was not enough: the log showed ON/OFF/ON/OFF/ON/OFF in
-       * eight lines. ZL and ZR are analogue triggers and do not cross the
-       * digital threshold on the same frame, so the chord makes and breaks
-       * repeatedly while the player is still squeezing. A cooldown makes one
-       * squeeze mean one toggle. */
-      if (!chord_latched && !chord_cool) {
-        chord_latched = 1;
-        chord_cool    = 30;              /* ~half a second */
-        s_visible = (s_visible > 0) ? 0 : 1;
-        logf_("nxp: cursor %s (ZL+ZR)\n", s_visible ? "ON" : "OFF");
-      }
-    } else if (!(held & CHORD)) {
-      chord_latched = 0;                 /* only re-arm when BOTH are released */
-    }
+  /* '+' toggles the cursor; '-' toggles gyro pointing. */
+  if (pressed & HidNpadButton_Plus) {
+    s_visible = (s_visible > 0) ? 0 : 1;
+    logf_("nxp: cursor %s\n", s_visible ? "ON" : "OFF");
   }
   if (pressed & HidNpadButton_Minus) {
     if (s_mouse_connected) {
@@ -677,12 +662,14 @@ void nxp_update(void) {
   /* L / R recenter the cursor to the middle of the screen. Handy with gyro:
    * point the controller where it's comfortable, recenter, and aim from there
    * (like recentering a VR view). Works in every mode. */
-  /* L and R used to recentre the cursor (and force it visible). They are game
-   * buttons now that the pad bridge is live -- Daggerfall binds them to Sneak
-   * and ReadyWeapon -- so recentring stole a press from the game every time,
-   * and could pop the cursor up unasked in the middle of play. Removed; the
-   * cursor is steered with the stick and toggled with ZL+ZR. */
+  if (pressed & (HidNpadButton_L | HidNpadButton_R)) {
+    s_cx = s_cfg.screen_w * 0.5f;
+    s_cy = s_cfg.screen_h * 0.5f;
+    if (s_visible <= 0) s_visible = 1;    /* show it so you can see where it went */
+    logf_("nxp: cursor recentered\n");
+  }
 
+  do_dpad(held, pressed);
 
   s_nev = 0;
 
@@ -691,16 +678,6 @@ void nxp_update(void) {
   /* Mouse first: it sets s_mouse_connected, which gates the gyro below. */
   const int mouse_tap = do_mouse();
   do_gyro();                               /* no-op if off, or if a mouse is in */
-
-  /* Rising edge of visibility: do NOT accept a tap from a button that was
-   * already held when the cursor appeared. ZL+ZR is the toggle chord, so the
-   * triggers are by definition down at that moment -- without this, showing the
-   * cursor immediately clicks wherever it happens to be. Armed once every tap
-   * button has been seen released. */
-  static int s_was_visible = 0;
-  const int vis = (s_visible > 0);
-  if (vis && !s_was_visible) s_tap_armed = 0;
-  s_was_visible = vis;
 
   if (s_visible > 0) {
     HidAnalogStickState ls = padGetStickPos(&s_pad, 0);
@@ -712,29 +689,8 @@ void nxp_update(void) {
 
     /* A, ZR and ZL all confirm/tap (ZL/ZR let you play one-handed), as does the
      * mouse's left button. */
-    /* ZL/ZR still tap, EXCEPT while both are held -- that is the cursor toggle
-     * chord, and letting it click as well would fire a tap wherever the cursor
-     * happened to be at the moment you toggled. */
-    const u64 CHORD = HidNpadButton_ZL | HidNpadButton_ZR;
-    const u64 tapbits = ((held & CHORD) == CHORD)
-                        ? (held & HidNpadButton_A)
-                        : (held & (HidNpadButton_A | HidNpadButton_ZR | HidNpadButton_ZL));
-    int tap = (tapbits ? 1 : 0) | mouse_tap;
-
-    /* Arm on the RAW physical state, not on `tap`.
-     *
-     * `tap` is already chord-suppressed: while ZL+ZR are both down it ignores
-     * them and reports only A. So arming on `tap == 0` would arm INSTANTLY on
-     * the frame the chord shows the cursor -- with both triggers still
-     * physically held -- and then the moment the player let go of ZR while
-     * still holding ZL, that lone trigger would read as a fresh tap and click.
-     * Which is the very thing this is here to prevent. */
-    const int rawtap = ((held & (HidNpadButton_A | HidNpadButton_ZR |
-                                 HidNpadButton_ZL)) != 0) | mouse_tap;
-    if (!s_tap_armed) {
-      if (rawtap) tap = 0;       /* still holding something from before */
-      else        s_tap_armed = 1;
-    }
+    const int tap = ((held & (HidNpadButton_A | HidNpadButton_ZR | HidNpadButton_ZL)) ? 1 : 0)
+                    | mouse_tap;
     int phase = 0;
     if      ( tap && !s_tap_prev) phase = NXP_DOWN;
     else if ( tap &&  s_tap_prev) phase = NXP_MOVE;
@@ -742,21 +698,6 @@ void nxp_update(void) {
     s_tap_prev = tap;
     if (phase) push(s_cfg.cursor_id, s_cx, s_cy, phase);
   } else {
-    /* THE CURSOR WENT AWAY WITH A FINGER STILL DOWN.
-     *
-     * This branch used to just clear s_tap_prev, which drops the touch without
-     * ever sending its UP. The game keeps believing a finger is pressed at the
-     * last cursor position -- so the on-screen virtual joystick stays deflected
-     * and the character walks forever, and a menu button under the cursor keeps
-     * firing. Both were reported, and both pointed at the cursor because
-     * ZL+ZR IS the toggle: dismissing the cursor while the triggers are still
-     * held is precisely the case that strands the touch.
-     *
-     * Send the UP the game is waiting for. */
-    if (s_tap_prev) {
-      push(s_cfg.cursor_id, s_cx, s_cy, NXP_UP);
-      logf_("nxp: cursor hidden mid-touch -> sent the missing UP\n");
-    }
     s_tap_prev = 0;
   }
 
@@ -770,25 +711,6 @@ int nxp_poll(NxpEvent *out, int max) {
 }
 
 int   nxp_cursor_visible(void)          { return s_visible > 0; }
-
-/* Release an in-flight touch from OUTSIDE the pointer pump.
- *
- * Anything that stops nxp_update() running while a finger is down strands that
- * touch exactly as the hidden-cursor case did: the software keyboard applet
- * blocks the render thread for as long as it is on screen, and the game spends
- * that whole time believing a finger is pressed. Callers that are about to
- * block should say so here first. Safe to call when nothing is down. */
-void nxp_release_touch(void) {
-  if (s_ready && s_tap_prev) {
-    push(s_cfg.cursor_id, s_cx, s_cy, NXP_UP);
-    s_tap_prev = 0;
-    logf_("nxp: touch released before a blocking call\n");
-  }
-  /* Disarm as well. The applet can be on screen for a long time and the player
-   * will still be holding whatever they held when it opened; without this, the
-   * first frame after it closes reads that as a brand-new press and clicks. */
-  s_tap_armed = 0;
-}
 void  nxp_cursor_pos(float *x, float *y){ if (x) *x = s_cx; if (y) *y = s_cy; }
 float nxp_stick_speed(void)             { return s_stick_speed; }
 float nxp_mouse_sens(void)              { return s_mouse_sens; }

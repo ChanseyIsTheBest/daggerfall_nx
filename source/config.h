@@ -1,194 +1,201 @@
-/* config.h -- Daggerfall Unity Switch wrapper configuration
- * (forked from the PvZ Fusion 3.8.1 wrapper config, itself from Zookeeper DX.)
+/* config.h -- config.txt next to the .nro, plus the hardcoded decisions.
  *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
+ * MIT licensed. See LICENSE.
  */
+#ifndef PPS_CONFIG_H
+#define PPS_CONFIG_H
 
-#ifndef __CONFIG_H__
-#define __CONFIG_H__
+void cfg_load(void);
 
-/* ============================ MEMORY LAYOUT ==============================
- * These are engine-fitting parameters, not game content. The starting values
- * are inherited from PvZ Fusion because it is the SAME Unity minor version
- * (2022.3.62) and we apply the SAME 256MB->64MB region-granularity patch (see
- * nx_patch_dfu.h).
+const char *cfg_language(void);   /* "en", "de", ... or the console's own    */
+const char *cfg_country(void);    /* "GB", "US", ...                          */
+int   cfg_vsync(void);
+float cfg_master_volume(void);
+int   cfg_target_fps(void);       /* what the engine is told to aim for       */
+int   cfg_purchases_enabled(void);
+
+/* ------------------------------------------------------------------ */
+/* Render size                                                         */
+/* ------------------------------------------------------------------ */
+
+/* 1080p in handheld as well as docked.
  *
- * !! READ THIS BEFORE YOU TOUCH ANYTHING ELSE !!
+ * The handheld panel is 720p, so the compositor downscales. That costs almost
+ * nothing for a 2.5D casual title, and a fixed render size means the whole
+ * class of surface-change bugs stops existing: the engine is told one size
+ * once and never has to be told again.
  *
- * Daggerfall Unity is a MUCH heavier memory client than PvZ Fusion, and these
- * numbers are the single most likely thing to need changing. PvZ's tuning was
- * balanced against an observed ~551 MB live working set on a bounded scene.
- * Daggerfall streams an open world, keeps large texture and terrain caches, and
- * has a mod loader; its working set is larger and, unlike PvZ's, it GROWS as
- * you travel rather than settling after the first scene.
+ * That matters more here than it did for Osmos, because this engine's
+ * onSurfaceChanged path calls BOTH init(w,h,rot) AND updateScreenSize(w,h),
+ * and init() is the constructor for the entire application object. Firing it
+ * a second time on a dock would re-enter engine startup rather than resize
+ * anything. With a fixed size it can only ever run once, which is the shape
+ * the Java code assumed too -- GameRenderer guards init with mSurfaceCreated
+ * and never expects a second call with different dimensions. */
+/* MEASURED ON HARDWARE: the engine asks for 640x960 with rotation 1.
  *
- * So treat every number below as a STARTING POINT, not a known-good value.
- * The good news is the failure mode is legible: each arena logs which knob
- * starved when it OOMs. Bring the port up with DEBUG_LOG 1 and read the log.
+ *     [I] GameLib.setupPlatform(640, 960, rot 1, 60 fps, msaa 0)
  *
- * The budget is roughly (newlib heap + mmap arena + OC pool) <= ~2945 MB in
- * title-override mode. You cannot simply raise everything; growing one shrinks
- * the others. PvZ's history, kept because the failure points are informative:
- *   - OC pool at 256 MB exhausted during scene load -> hard OOM
- *   - mmap arena at 512 MB could not fit a 127 MB overflow -> mmap NULL -> crash
- *   - mmap arena granularity at 16 MB CORRUPTED the Dynamic Heap allocator at
- *     init (overlapping regions from the over-map/trim pattern). 64 MB is the
- *     known-good floor and must match the libunity patch. Do not lower it.
- * ======================================================================== */
-
-// The engine + libc++ + il2cpp heap need a generous newlib heap; the rest of
-// system memory is handed to the .so loader (see __libnx_initheap).
-#define MEMORY_MB 768
-
-// Anonymous-mmap arena. Unity reserves big region-aligned pools by over-mmapping
-// then munmapping the unaligned head/tail. We back anonymous mmaps from a
-// dedicated, region-aligned arena with a per-page used-bitmap so sub-range
-// munmap frees exactly the trimmed pages.
-#define MMAP_ARENA_ALIGN    ((size_t)64 * 1024 * 1024)    // MUST match the libunity patch (nx_patch_dfu.h). 16MB corrupts the allocator; do not lower.
-/* Heap-backed mmap arena. RAISED 192 -> 320 MB on evidence, not on feel: the
- * FMV-to-dungeon run filled it to 189 MB of 192 --
- *     [mmap] fallback 19736 KB -> ... (total 189 MB)
- * -- i.e. 98%, one more fallback from the "mmap NULL during world load" this
- * comment used to only warn about. Must stay a multiple of MMAP_ARENA_ALIGN. */
-#define MMAP_ARENA_RESERVE  ((size_t)320 * 1024 * 1024)
-
-// Stack-region overcommit (OC) arena (see libc_shim.c): PROT_NONE reservations
-// held in a stack-region window, committed pages backed from a small heap pool.
-#define OC_WINDOW_BYTES     ((size_t)2048 * 1024 * 1024)  // cheap PROT_NONE reservation; the window-finder clamps to the largest stack-region hole.
-// Commit-pool: real memory backing touched pages of the OC window. Unity is told
-// it has 512 MB (libc_shim.c __sysconf PHYS_PAGES + dalvik.vm.heapsize), reserves
-// its heaps as big PROT_NONE regions that route here, so this pool must be able
-// to back what Unity actually touches. This is the knob Daggerfall is most
-// likely to exhaust -- watch for it growing as you fast-travel.
-/* Lowered 896 -> 768 to pay for the arena growth above, because total reserve
- * is bounded and this had the slack: the same run peaked at 662 MB of 896
- * ("[oc] committed 253 MB (pool 662/896 MB ...)"), so 768 still leaves ~106 MB
- * of headroom over the observed high-water mark. If a later log shows the pool
- * near 768, take the next 128 MB from the GPU arena rather than from here. */
-#define OC_POOL_BYTES       ((size_t)768 * 1024 * 1024)
-
-// Overcommit (alias-region) mode: reserve a big *virtual* window (PROT_NONE
-// costs only address space) and commit physical pages on demand -- true
-// overcommit, matching Android.
-#define MMAP_VIRT_RESERVE   ((size_t)6144 * 1024 * 1024)  // 6 GB virtual reservation window
-#define OVERCOMMIT_HEAP_MB  608u                          // newlib malloc + .so load zone
-
-/* ============================ GAME IDENTITY =============================== */
-
-// Daggerfall Unity ships the engine as the standard modern Unity trio:
-// libmain.so dlopens libunity.so which dlopens libil2cpp.so. main.c loads all
-// three directly, so these SO_NAME macros are kept only for parity with the base.
-#define SO_NAME      "libunity.so"
-#define SO_CPP_NAME  "libil2cpp.so"
-
-// The SD-card folder holding the .nro + the game files.
-/* The folder name is now only a FALLBACK, used if the runtime scan finds
- * nothing (nx_data_root.c step 6). It is no longer load-bearing: name the
- * folder anything, put it anywhere on the card. */
-#define GAME_FOLDER  "daggerfall"
-
-/* LOG_NAME and GAME_HOME are GONE. Both were compile-time paths built from
- * GAME_FOLDER, and both were load-bearing in the worst way: name the folder
- * anything else and the loader could not find libmain.so, and could not write
- * a log to say so, because the log lived under the same wrong root.
+ * That is PORTRAIT, 2:3, and rotation 1 is SCREEN_ROTATION_90. setupPlatform
+ * is how native tells the platform layer what surface it wants, so this is the
+ * engine's own answer to "what shape am I". Papa Pear Saga shipped portrait on
+ * phones and the aspect it names is a phone aspect.
  *
- * Use instead, from nx_data_root.h:
- *     g_data_root      the resolved folder      (was GAME_HOME)
- *     g_log_path       <root>/debug.log         (was LOG_NAME)
- *     nx_path("/sub")  <root>/sub               (was GAME_HOME "/sub")
+ * We give it 1920x1080 anyway, and it accepts that -- init() and
+ * updateScreenSize() both take the real size and it lays out from those. But
+ * if the interface turns out to be positioned for a 2:3 screen, this is the
+ * first thing to change, and main.c logs the mismatch every boot so the
+ * evidence is in front of you rather than in a comment.
  *
- * Do not reintroduce them. If you need a path, it is a runtime value. */
+ * Rendering portrait on a landscape panel means letterboxing to roughly
+ * 720x1080 with bars either side. If you want to try it, set these to 720 and
+ * 1080 and leave PPS_ROTATION at 0 -- do NOT set the rotation to 1 as well,
+ * because that value only tells the engine how to compensate its input
+ * transform, and a non-zero one rotates touch away from the display. */
+#define PPS_RENDER_W 1920
+#define PPS_RENDER_H 1080
 
-/* getenv("HOME") / getpwuid()->pw_dir now return g_data_root (libc_shim.c).
+/* The touch panel reports in 1280x720 regardless of render size, so touches
+ * have to be scaled up into render space before they reach onTouchEvent. */
+#define PPS_PANEL_W  1280
+#define PPS_PANEL_H  720
+
+/* GameRenderer$ScreenRotation.getId(): SCREEN_ROTATION_0 is ordinal 0 and the
+ * console never rotates. The engine is landscape-only here.
  *
- * This matters here: Daggerfall Unity writes real files -- saves, settings.ini,
- * its own log -- through managed System.IO, deriving the paths from
- * Application.persistentDataPath, which lands under HOME. Saves therefore go to
- * the same folder as the .nro, whatever it is called. */
+ * Do not be tempted to pass 90 or 270 to get the portrait layout: this game
+ * shipped portrait on phones and landscape on tablets, and it selects between
+ * them from the ASPECT of the surface, not from this value. A 16:9 landscape
+ * surface already picks the landscape layout; the rotation id only tells the
+ * engine how to compensate its input transform, so a non-zero value here
+ * rotates the touch mapping away from the display. */
+#define PPS_ROTATION 0
 
-// flip to 1 (and rebuild) to get file logging (debug.log) for on-hardware debugging
-#define DEBUG_LOG 0   /* ON: leave it on for the whole bring-up */
-
-/* High-volume per-operation traces. Invaluable for black-screen / boot-hang
- * triage, catastrophic for load speed once the game runs: every data.unity3d
- * read/lseek and most mprot calls fflush two lines to the SD card. Daggerfall
- * loads far more bundles than PvZ did, so leaving these on will look like a
- * hang. Keep them OFF for normal play. */
-/* How often debugPrintf is allowed to hit the SD card, in milliseconds. Each
- * flush is a synchronous write; flushing per line cost ~11,000 of them a run
- * and was a visible source of stutter. The crash handler flushes explicitly, so
- * this only bounds what a hard HANG could lose. */
-#define LOG_FLUSH_MS    250
-
-/* Per-open file trace ("[io] open(...)"). 2181 lines in a normal run, one
- * synchronous formatting call per game file open, and Daggerfall opens BSA
- * files constantly. Off by default; turn on to debug a missing-file problem. */
-#define TRACE_FILE_IO   0
-
-#define TRACE_BUNDLE_IO 0   /* per-read/lseek trace of data.unity3d */
-#define TRACE_MPROT     0   /* per-mprotect commit trace */
-
-/* JNI approximation ledger (jni_fake.c, adopted from killerbean_nx).
+/* setupPlatform(width, height, rotation, targetFps, msaaSamples).
  *
- * Records every distinct place the fake JNI returns a plausible LIE -- empty
- * string, null object, zero, no-op -- counts hits, and marks the ones Unity ran
- * ExceptionCheck against immediately afterwards. Those INSPECTED entries are
- * the fakes whose wrong answer becomes a stored value inside the engine; the
- * rest are calls nobody reads. That is the difference between the forty things
- * we fake and the three that matter.
- *
- * ON by default here, unlike the reference ports, because this port has not
- * booted yet and PORTING.md sec 8 says the first run's goal is a log rather
- * than a game. Cost is one compare in the dispatch hot path plus one line per
- * NEW site (repeat hits are counted, not printed). Set to 0 for release; the
- * ledger is also fully suppressed when DEBUG_LOG is 0. */
-#define DFU_JNI_LOUD 1
+ * MSAA 0: the engine composites through an offscreen FBO, and a multisampled
+ * default framebuffer would be resolved and then discarded. Nothing on screen
+ * comes from the window surface directly. */
+#define PPS_MSAA_SAMPLES 0
 
-/* Adopted with the clonehero_nx JNI layer. DFU_JNI_LEDGER gates the
- * approximation ledger (was DFU_JNI_LOUD's job before the swap; both are on).
- * DFU_JNI_QUARANTINE is the local-ref quarantine depth: a freed ref is held in
- * a ring and released only once this many more have been retired, so a
- * use-after-free reads stale data instead of reallocated memory. */
-/* TIER 2 PAD BRIDGE -- BACK ON. The isolation experiment is finished and it
- * cleared this code.
- *
- * sec 16 turned it off to find out whether it was the source of
- *     terminating with uncaught exception of type Il2CppExceptionWrapper
- * and wrote down what each outcome would mean: "game survives -> the bridge was
- * the source"; "still aborts -> the bridge is innocent, turn it back on."
- *
- * The abort still occurs with DFU_PAD_BRIDGE=0. So the bridge is innocent, and
- * leaving it off was costing every button and stick on the console for nothing
- * -- with it off the only input is nx_pointer's cursor emulation (A/ZR/ZL tap,
- * D-pad scroll, stick moves a pointer), which is exactly the "most of the
- * buttons and sticks don't work" being reported.
- *
- * The unsafe-by-construction concern from sec 16 stands and is NOT fixed:
- * SetKey/SetAxis/TriggerAction are managed methods called from a C frame, and a
- * C frame cannot catch the C++ exception IL2CPP raises. il2cpp_runtime_invoke
- * (exported at 0x1bd7a2c) RETURNS the exception instead of throwing it and is
- * the proper firewall, but it takes a MethodInfo*, and this port has raw RVAs
- * rather than MethodInfo pointers -- so adopting it is real work, not a
- * one-liner, and it is not what is failing today. */
-/* Longest name the software keyboard will accept. Daggerfall's own character
- * name box caps well below this; the applet just needs an upper bound. */
-#define DFU_KBD_MAXLEN     32
+/* Frame pacing. The Java renderer slept to hold getTargetFps(); here the EGL
+ * swap interval does that job, so this is only what the engine is told. 60 is
+ * what the Android build asked for on a capable device. */
+#define PPS_TARGET_FPS_DEFAULT 60
 
-#define DFU_PAD_BRIDGE     1
+/* Device metrics handed to Device.getDpi(). The engine divides by 160 to get a
+ * density bucket and picks its asset scale from it; 320 is the xhdpi bucket,
+ * which is the tier whose art this APK actually ships. */
+#define PPS_DPI 320.0f
 
-#define DFU_JNI_LEDGER     1
-#define DFU_JNI_QUARANTINE 512
+/* Device.isTablet(). True: at 16:9 and 1920 wide this is a tablet-class
+ * surface, and the phone layout would letterbox its HUD into the middle. */
+#define PPS_IS_TABLET 1
 
-/* ------------------------- NO RUNTIME CONFIGURATION -----------------------
- * There is no config.txt: nothing is read from the SD card and nothing is
- * written to it. Everything above is a build-time constant, deliberately.
+/* ------------------------------------------------------------------ */
+/* Touch                                                               */
+/* ------------------------------------------------------------------ */
+
+/* Engine touch types, decoded from GameView.onTouchEvent's packed-switch:
+ * Android's ACTION_* are mapped down to these four before they reach native.
+ * ACTION_POINTER_DOWN/UP fold into DOWN/UP and ACTION_OUTSIDE into MOVE. */
+#define PPS_TOUCH_DOWN   0
+#define PPS_TOUCH_UP     1
+#define PPS_TOUCH_MOVE   2
+#define PPS_TOUCH_CANCEL 3
+
+/* How many pointers the engine is fed. The panel reports up to 16; the game
+ * is a one-finger aim-and-fire and its own code only ever tracks a couple. */
+#define PPS_MAX_TOUCHES 4
+
+/* ------------------------------------------------------------------ */
+/* System events                                                       */
+/* ------------------------------------------------------------------ */
+
+/* NativeApplication$ESystemEvent ordinals, in declaration order from the
+ * enum's <clinit>. These are ordinals, not opaque ids: the Java side passed
+ * ESystemEvent.ordinal() straight through to onSystemEvent(int). */
+#define PPS_EV_WILL_RESIGN_ACTIVE   0
+#define PPS_EV_DID_BECOME_ACTIVE    1
+#define PPS_EV_WILL_TERMINATE       2
+#define PPS_EV_DID_ENTER_BACKGROUND 3
+#define PPS_EV_WILL_ENTER_FOREGROUND 4
+#define PPS_EV_GL_CONTEXT_RECREATED 5
+#define PPS_EV_MEMORY_WARNING       6
+
+/* ------------------------------------------------------------------ */
+/* Diagnostics                                                         */
+/* ------------------------------------------------------------------ */
+
+/* ON, because this port has never run on hardware.
  *
- * The two globals below are the render size in use right now. They are NOT
- * settings: config.c gives them the handheld panel size as a starting value and
- * android_native_update_mode() re-derives them from the docked/handheld state
- * every frame.                                                              */
-extern int screen_width;
-extern int screen_height;
+ * With this at 0 a normal session writes no debug.log at all, which is the
+ * right default once the port works. It is the wrong default now: the failures
+ * ahead -- a static initialiser faulting, a shader that will not compile, an
+ * asset root one directory off -- all present identically as "it stopped", and
+ * the boot log plus diag_phase is the difference between knowing where and
+ * guessing.
+ *
+ * Set it back to 0 once you are past bring-up. Warnings and errors are logged
+ * either way; they open the file lazily so a clean run leaves nothing behind.
+ *
+ * PPS_DIAG stays 0. That one is the heavy tracing -- a line per JNI call and
+ * per touch -- and at 60 fps it writes faster than the SD card will take it,
+ * which changes the timing of whatever you were trying to observe. Turn it on
+ * only for a specific question, and expect the frame rate to suffer. */
+#ifndef DEBUG_LOG
+#define DEBUG_LOG 1
+#endif
+
+#ifndef PPS_DIAG
+#define PPS_DIAG 0
+#endif
+
+/* Mirror the engine's own __android_log_print output into debug.log. Cheap
+ * (this engine logs perhaps a hundred lines a boot, not per frame) and it is
+ * the single most useful thing to have when the screen is black, because the
+ * King engine reports its own asset and shader failures through it. Follows
+ * DEBUG_LOG so it costs nothing in a normal build. */
+#define PPS_MIRROR_ENGINE_LOG DEBUG_LOG
+
+/* ------------------------------------------------------------------ */
+/* compatibility with the reused files                                 */
+/* ------------------------------------------------------------------ */
+
+/* opensles.c is compiled in unmodified from the Sonic Jump port, and that port
+ * kept its settings in a `Config config` global rather than behind accessors.
+ * It reads exactly one field. Providing it here is what lets opensles.c drop
+ * in untouched, which is the same trade the forwarder headers make for
+ * libc_shim.c -- upstream fixes stay pullable.
+ *
+ * decode_stream_audio gates OpenSL's MIME / Android-fd source path, which
+ * decodes a compressed stream rather than taking PCM from a buffer queue.
+ * This engine feeds the buffer queue -- it carries its own Vorbis decoder --
+ * so the path is unlikely to be reached. It is left enabled because the cost
+ * of being wrong in that direction is a log line, and the cost of being wrong
+ * in the other is silence with no explanation. */
+typedef struct { int decode_stream_audio; } PpsCompatConfig;
+extern PpsCompatConfig config;
+
+void log_init(void);
+void log_close(void);
+void log_write(char level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void overlay_note(const char *text);
+/* error_screen() and fatal_error() are declared in error.h. */
+
+#define LOGW(...) log_write('W', __VA_ARGS__)
+#define LOGE(...) log_write('E', __VA_ARGS__)
+
+#if DEBUG_LOG
+#define LOGB(...) log_write('I', __VA_ARGS__)
+#else
+#define LOGB(...) ((void)0)
+#endif
+
+#if DEBUG_LOG && PPS_DIAG
+#define LOGI(...) log_write('I', __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#endif
 
 #endif

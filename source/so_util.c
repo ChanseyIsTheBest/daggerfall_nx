@@ -5,8 +5,7 @@
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  *
- * Loads Android ARM64 shared objects into a reserved memory range and applies
- * the relocation types used by libff4.so.
+ * Loads and relocates Android ARM64 shared objects in reserved memory.
  */
 
 #include <switch.h>
@@ -19,6 +18,7 @@
 
 #include "config.h"
 #include "so_util.h"
+#include "error.h"
 #include "util.h"
 #include "error.h"
 
@@ -44,6 +44,15 @@ void hook_arm64(uintptr_t addr, uintptr_t dst) {
 }
 
 void so_flush_caches(so_module *mod) {
+  /* load_virtbase is only a *reservation* until so_finalize runs the
+   * svcMapProcessCodeMemory that backs it. Touching it before then faults on
+   * the first cache line, and the crash report points at armDCacheFlush with
+   * nothing to connect it to the loader. Fail with a sentence instead. */
+  if (!mod->finalized)
+    fatal_error("so_flush_caches(%s) called before so_finalize.\n\n"
+                "load_virtbase is reserved but not mapped until so_finalize "
+                "runs svcMapProcessCodeMemory, so flushing it here faults.",
+                mod->name[0] ? mod->name : "module");
   armDCacheFlush(mod->load_virtbase, mod->load_size);
   armICacheInvalidate(mod->load_virtbase, mod->load_size);
 }
@@ -55,6 +64,7 @@ void so_free_temp(so_module *mod) {
 
 void so_finalize(so_module *mod) {
   Result rc = 0;
+  mod->finalized = 1;
 
   // map the entire thing as code memory
   rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
@@ -146,7 +156,7 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   mod->shstrtab = (char *)((uintptr_t)mod->so_base + mod->sec_hdr[mod->elf_hdr->e_shstrndx].sh_offset);
 
   if (mod->elf_hdr->e_phnum > SO_MAX_SEGMENTS * 2) {
-    debugPrintf("so_load: %s has too many program headers (%d)\n", filename, mod->elf_hdr->e_phnum);
+    
     res = -4;
     goto err_free_so;
   }
@@ -174,6 +184,14 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
 
   mod->load_base = base;
   if (!mod->load_base) goto err_free_so;
+  /* max_size was accepted and then ignored, so a module larger than the
+   * caller's arena would be memset and memcpy'd straight past the end of it.
+   * Nothing in this port trips it -- libsonicjumpgame.so needs ~5.3 MB -- but
+   * a silent heap overrun is not a thing to leave armed. */
+  if (mod->load_size > max_size) {
+    res = -6;
+    goto err_free_so;
+  }
   memset(mod->load_base, 0, mod->load_size);
 
   // reserve virtual memory space for the entire LOAD zone
@@ -406,7 +424,6 @@ static uintptr_t so_resolve_symbol(so_module *mod, DynLibFunction *funcs, int nu
 }
 
 int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_missing_imports) {
-  int missing = 0;
   for (int i = 0; i < mod->elf_hdr->e_shnum; i++) {
     char *sh_name = mod->shstrtab + mod->sec_hdr[i].sh_name;
     if (strcmp(sh_name, ".rela.dyn") == 0 || strcmp(sh_name, ".rela.plt") == 0) {
@@ -427,9 +444,6 @@ int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_m
               if (addr) {
                 *ptr = addr + rels[j].r_addend;
               } else {
-                missing++;
-                debugPrintf("%s: unresolved import: %s\n", mod->name, name);
-                // Poison unresolved imports when requested.
                 if (taint_missing_imports)
                   *ptr = rels[j].r_offset;
               }
@@ -445,32 +459,22 @@ int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_m
     }
   }
 
-  if (missing)
-    debugPrintf("%s: %d unresolved imports\n", mod->name, missing);
-
   return 0;
 }
 
 void so_execute_init_array(so_module *mod) {
-  debugPrintf("[init] >>> enter init_array for %s\n", mod->name);
   for (int i = 0; i < mod->elf_hdr->e_shnum; i++) {
     char *sh_name = mod->shstrtab + mod->sec_hdr[i].sh_name;
     if (strcmp(sh_name, ".init_array") == 0) {
       int (** init_array)() = (void *)((uintptr_t)mod->load_virtbase + mod->sec_hdr[i].sh_addr);
       int n = (int)(mod->sec_hdr[i].sh_size / 8);
-      debugPrintf("[init] %s: %d ctors\n", mod->name, n);
       for (int j = 0; j < n; j++) {
         if (init_array[j] != 0) {
-          if (j < 8 || (j % 25) == 0 || j == n - 1)
-            debugPrintf("[init] %s %d/%d off=0x%lx\n", mod->name, j, n,
-                        (unsigned long)((uintptr_t)init_array[j] - (uintptr_t)mod->load_virtbase));
           init_array[j]();
         }
       }
-      debugPrintf("[init] %s: ctors done\n", mod->name);
     }
   }
-  debugPrintf("[init] <<< done init_array for %s\n", mod->name);
 }
 
 uintptr_t so_find_addr(so_module *mod, const char *symbol) {
@@ -592,6 +596,20 @@ int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), voi
  * Must run while the code is still writable (load_base), before so_finalize.
  */
 void so_patch_stack_canaries(so_module *mod) {
+  /* Writes to .text, so it must run BEFORE so_finalize -- the kernel never
+   * permits a W->X transition on code memory once svcMapProcessCodeMemory has
+   * mapped it, so a patch applied afterwards either faults or silently does
+   * nothing. This is the twin of the guard in so_flush_caches above, which
+   * catches the same ordering mistake from the other side; only that one
+   * existed, and this port had both errors at once.
+   *
+   * (Local addition to an otherwise unmodified so_util.c.) */
+  if (mod->finalized)
+    fatal_error("so_patch_stack_canaries(%s) called after so_finalize.\n\n"
+                ".text is mapped read-execute by then and the kernel does not "
+                "allow a write to it. Move the call before so_finalize.",
+                mod->name[0] ? mod->name : "module");
+
   for (int s = 0; s < mod->elf_hdr->e_shnum; s++) {
     char *sh_name = mod->shstrtab + mod->sec_hdr[s].sh_name;
     if (strcmp(sh_name, ".text") != 0)
@@ -599,8 +617,6 @@ void so_patch_stack_canaries(so_module *mod) {
     uintptr_t text_base = (uintptr_t)mod->load_base + mod->sec_hdr[s].sh_addr;
     uint32_t *code = (uint32_t *)text_base;
     int n = (int)(mod->sec_hdr[s].sh_size / 4);
-    int patched = 0;
-    long first_vaddr = -1, first_word = 0;
     for (int i = 0; i + 12 < n; i++) {
       uint32_t w = code[i];
       /* guard load: ldr Xt,[Xn,#0x28]  (64-bit unsigned-offset, imm12==5) */
@@ -627,8 +643,6 @@ void so_patch_stack_canaries(so_module *mod) {
             if ((code[tgt + m] & 0xFC000000) == 0x94000000) { has_bl = 1; break; }
           if (has_bl) {
             code[i + k] = 0xD503201F; /* NOP */
-            if (first_vaddr < 0) { first_vaddr = (long)(mod->sec_hdr[s].sh_addr + (i + k) * 4); }
-            patched++;
           }
           break;
         }
@@ -638,10 +652,6 @@ void so_patch_stack_canaries(so_module *mod) {
      * from load_virtbase after so_finalize aliases them. Clean dcache for what we
      * wrote so it reaches physical memory before the icache is invalidated. */
     armDCacheFlush((void *)text_base, mod->sec_hdr[s].sh_size);
-    if (first_vaddr >= 0)
-      first_word = (long)((uint32_t *)((uintptr_t)mod->load_base + first_vaddr))[0];
-    debugPrintf("[patch] %s: neutralized %d stack-canary checks (first@0x%lx readback=0x%08lx)\n",
-                mod->name, patched, (unsigned long)first_vaddr, (unsigned long)first_word);
   }
 }
 
@@ -659,12 +669,11 @@ int so_patch_code(void *dst, const void *src, size_t len) {
   void *alias = virtmemFindAslr(maplen, 0);
   VirtmemReservation *rv = alias ? virtmemAddReservation(alias, maplen) : NULL;
   virtmemUnlock();
-  if (!alias) { debugPrintf("[patch] no aslr slot\n"); return -1; }
+  if (!alias) {  return -1; }
   Result rc = svcMapProcessMemory(alias, envGetOwnProcessHandle(), (u64)start, maplen);
   if (R_FAILED(rc)) {
     virtmemLock(); if (rv) virtmemRemoveReservation(rv); virtmemUnlock();
-    debugPrintf("[patch] svcMapProcessMemory %p<-0x%lx (%zu) failed rc=%08x\n",
-                alias, (unsigned long)start, maplen, rc);
+    
     return -2;
   }
   memcpy((uint8_t *)alias + off, src, len);
@@ -672,6 +681,6 @@ int so_patch_code(void *dst, const void *src, size_t len) {
   virtmemLock(); if (rv) virtmemRemoveReservation(rv); virtmemUnlock();
   armDCacheFlush(dst, len);
   armICacheInvalidate(dst, len);
-  debugPrintf("[patch] ok %p (%zu bytes)\n", dst, len);
+  
   return 0;
 }

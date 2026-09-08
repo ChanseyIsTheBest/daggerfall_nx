@@ -1,4 +1,4 @@
-/* libc_shim.h -- bionic-compatible libc wrappers for libcrx.so + libc++_shared
+/* Bionic-compatible libc wrappers for Android game libraries.
  *
  * This software may be modified and distributed under the terms
  * of the MIT license. See the LICENSE file for details.
@@ -15,10 +15,10 @@
 #include <pthread.h>
 
 // Return `p` with any leading "device:" (e.g. "sdmc:") stripped, so the result
-// is a Unix-rooted path ("/switch/zookeeper"). Paths handed to managed code
+// is a Unix-rooted path ("/switch/angrybirdsjourney_nx"). Paths handed to managed code
 // (Mono/IL2CPP) MUST be device-less: ":" isn't a Unix root marker, so a
 // "sdmc:/..." path is treated as relative and Path.Combine() concatenates it
-// after a relative asset path -> "assets/bin/Data/sdmc:/switch/zookeeper",
+// after a relative asset path -> "assets/bin/Data/sdmc:/switch/...",
 // which newlib then mis-parses (embedded device) and null-derefs. newlib still
 // resolves device-less absolute paths via the default device (sdmc, set by our
 // boot chdir), so file I/O is unaffected.
@@ -48,6 +48,8 @@ int  __FD_ISSET_chk_fake(int fd, const void *set, size_t setlen);
 
 // misc bionic
 int __system_property_get_fake(const char *name, char *value);
+const void *__system_property_find_fake(const char *name);
+int __system_property_read_fake(const void *pi, char *name, char *value);
 unsigned long getauxval_fake(unsigned long type);
 int gettid_fake(void);
 long syscall_fake(long number, ...);
@@ -71,18 +73,13 @@ int stat_fake(const char *path, struct bionic_stat *st);
 int fstat_fake(int fd, struct bionic_stat *st);
 int lstat_fake(const char *path, struct bionic_stat *st);
 void *readdir_fake(void *dirp);
+int closedir_fake(void *dirp);
 char *realpath_fake(const char *path, char *resolved);
 int strerror_r_fake(int err, char *buf, size_t len);
 int statvfs_fake(const char *path, void *buf);
 int statfs_fake(const char *path, void *buf);
 FILE *fopen_fake(const char *path, const char *mode);
-
-/* Mutex-locked open/close over newlib's process-wide FILE table. The engine's
- * worker threads reach it through fopen_fake/fclose_fake; anything else in the
- * port that opens files while the game is running (nx_pointer's pointer.cfg
- * writes) must use these so the two never collide. */
-FILE *nx_fopen_locked(const char *path, const char *mode);
-int   nx_fclose_locked(FILE *f);
+FILE *fdopen_fake(int fd, const char *mode);
 
 // locale
 void *newlocale_fake(int mask, const char *locale, void *base);
@@ -117,7 +114,9 @@ int ferror_fake(FILE *f);
 int feof_fake(FILE *f);
 int fileno_fake(FILE *f);
 int fseek_fake(FILE *f, long off, int whence);
+int fseeko_fake(FILE *f, long off, int whence);
 long ftell_fake(FILE *f);
+long ftello_fake(FILE *f);
 int getc_fake(FILE *f);
 int fgetc_fake(FILE *f);
 char *fgets_fake(char *s, int n, FILE *f);
@@ -130,14 +129,15 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va);
 int posix_memalign_fake(void **out, size_t align, size_t size);
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap_fake(void *addr, size_t length);
+int msync_fake(void *addr, size_t length, int flags);
 int mprotect_fake(void *addr, size_t len, int prot);
 int madvise_fake(void *addr, size_t len, int advice);
 
 // fd routing (fake pipe vs real files)
 long read_fake(int fd, void *buf, size_t count);
+long pread_fake(int fd, void *buf, size_t count, long off);
 long z_lseek(int fd, long off, int whence);   /* real lseek; also services lseek64 */
-extern int g_watch_fd;
-void watch_dump(const char *tag, int fd, long a, long b, const void *buf, long got);
+int  truncate_fake(const char *path, long len);
 long write_fake(int fd, const void *buf, size_t count);
 int  close_fake(int fd);
 int  pipe_fake(int fds[2]);

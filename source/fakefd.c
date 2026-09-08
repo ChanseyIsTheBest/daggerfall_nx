@@ -2,9 +2,16 @@
  *
  * libc_shim.c routes pipe()/read()/write()/close() on high-numbered fds through
  * these so the engine's pipe()/eventfd-style thread signalling works without a
- * real OS fd table. Ported from cr3_nx's android_native.c but standalone: Unity
- * uses ALooper only as a wait/wake primitive (no addFd), so this needs no looper
- * coupling. Thread-safe; lazily initialised.
+ * real OS fd table.
+ *
+ * Sonic Jump uses android_native_app_glue, which registers the read end of its
+ * command pipe with ALooper_addFd and then blocks in ALooper_pollOnce. That
+ * needs a readability query and a way to wait for one, so fakefd_readable()
+ * and fakefd_wait_readable() are provided below and android_native.c's looper
+ * is built on them. (The original Unity port needed neither: Unity uses
+ * ALooper purely as a wait/wake primitive and never calls addFd.)
+ *
+ * Thread-safe; lazily initialised.
  */
 
 #include <stdint.h>
@@ -38,6 +45,48 @@ static int alloc_slot(void) {
 
 int fakefd_is_fake(int fd) {
   return fd >= FAKE_FD_BASE && fd < FAKE_FD_BASE + MAX_FAKE_FDS;
+}
+
+/* Bytes currently buffered on a read end. 0 for anything else, so an unknown
+ * fd reads as "nothing to do" rather than spinning the looper. */
+int fakefd_readable(int fd) {
+  int idx, n = 0;
+  if (!fakefd_is_fake(fd)) return 0;
+  fakefd_once();
+  idx = fd - FAKE_FD_BASE;
+  mutexLock(&g_lock);
+  if (g_fds[idx].kind == FD_PIPE_R && g_fds[idx].pipe)
+    n = (int)g_fds[idx].pipe->len;
+  mutexUnlock(&g_lock);
+  return n;
+}
+
+/* Block until `fd` has data or `timeout_ns` elapses (negative = forever).
+ * Returns 1 if readable, 0 on timeout. This is what makes a blocking
+ * ALooper_pollOnce actually block instead of busy-waiting. */
+int fakefd_wait_readable(int fd, int64_t timeout_ns) {
+  int idx, ready = 0;
+  uint64_t deadline;
+  if (!fakefd_is_fake(fd)) return 0;
+  fakefd_once();
+  idx = fd - FAKE_FD_BASE;
+  deadline = armTicksToNs(armGetSystemTick()) + (timeout_ns > 0 ? (uint64_t)timeout_ns : 0);
+
+  mutexLock(&g_lock);
+  for (;;) {
+    if (g_fds[idx].kind != FD_PIPE_R || !g_fds[idx].pipe) break;
+    if (g_fds[idx].pipe->len > 0) { ready = 1; break; }
+    if (timeout_ns == 0) break;
+    if (timeout_ns < 0) {
+      condvarWait(&g_cond, &g_lock);
+    } else {
+      uint64_t now = armTicksToNs(armGetSystemTick());
+      if (now >= deadline) break;
+      condvarWaitTimeout(&g_cond, &g_lock, deadline - now);
+    }
+  }
+  mutexUnlock(&g_lock);
+  return ready;
 }
 
 int fakefd_pipe(int fds[2]) {

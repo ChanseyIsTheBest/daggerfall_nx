@@ -1,15 +1,4 @@
-/* opensles.c -- minimal OpenSL ES shim backed by SDL2 audio
- *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
- *
- * Implements the slice of OpenSL ES 1.0.1 the SQEX "Sd" sound driver uses:
- * the Object interface (Realize/GetInterface/Destroy), the Engine interface
- * (CreateOutputMix/CreateAudioPlayer), and on each player the Play, Volume and
- * AndroidSimpleBufferQueue interfaces. Players are software-mixed into one SDL2
- * audio device; the buffer-queue completion callback is fired from the SDL
- * audio thread, exactly like Android's fast-track callback.
- */
+/* Minimal OpenSL ES implementation backed by SDL2. */
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -18,14 +7,25 @@
 #include <math.h>
 #include <SDL2/SDL.h>
 
+#include "config.h"
 #include "opensles.h"
 #include "util.h"
+#include "mp3_decode.h"
+#include <unistd.h>
+#include <fcntl.h>
+/* Happy Wheels mixed its Cocos video-player audio in here. Sonic Jump has no
+ * video playback -- no MediaPlayer video path, no .mp4 in the asset set -- so
+ * the hook is gone and the mixer emits SFX plus music only. */
 
-// --- OpenSL ES constants ----------------------------------------------------
+/* OpenSL ES constants. */
 
-#define SL_RESULT_SUCCESS              0
-#define SL_RESULT_PARAMETER_INVALID    0x0D
+#define SL_RESULT_SUCCESS              0x00
+#define SL_RESULT_PARAMETER_INVALID    0x02
+#define SL_RESULT_MEMORY_FAILURE       0x03
+#define SL_RESULT_RESOURCE_ERROR       0x04
 #define SL_RESULT_FEATURE_UNSUPPORTED  0x0C
+#define SL_RESULT_INTERNAL_ERROR       0x0D
+#define SL_RESULT_CONTENT_UNSUPPORTED  0x09
 
 #define SL_BOOLEAN_FALSE 0
 #define SL_BOOLEAN_TRUE  1
@@ -74,10 +74,9 @@ typedef struct {
 typedef void *SLObjectItf;       // -> &obj->obj_vt
 typedef void *SLInterfaceID;
 
-// callback: (SLAndroidSimpleBufferQueueItf caller, void *pContext)
 typedef void (*slBufferQueueCallback)(void *caller, void *context);
 
-// --- interface-id sentinels -------------------------------------------------
+/* Interface IDs. */
 
 #define DEF_IID(n) void *SL_IID_##n = &SL_IID_##n
 DEF_IID(3DCOMMIT); DEF_IID(3DDOPPLER); DEF_IID(3DGROUPING); DEF_IID(3DLOCATION);
@@ -95,7 +94,7 @@ DEF_IID(PRESETREVERB); DEF_IID(RATEPITCH); DEF_IID(RECORD); DEF_IID(SEEK); DEF_I
 DEF_IID(VIBRA); DEF_IID(VIRTUALIZER); DEF_IID(VISUALIZATION); DEF_IID(VOLUME);
 #undef DEF_IID
 
-// --- vtable structs (method order matches the OpenSL ES 1.0.1 spec) ---------
+/* OpenSL ES 1.0.1 vtables. */
 
 typedef struct {
   SLresult (*Realize)(void *self, SLboolean async);
@@ -110,9 +109,6 @@ typedef struct {
   SLresult (*SetLossOfControlInterfaces)(void *self, SLint32 n, SLInterfaceID *ids, SLboolean enabled);
 } SLObjectItf_;
 
-// only CreateAudioPlayer (slot 2) and CreateOutputMix (slot 7) are used; the
-// rest keep the correct layout but are generic so a shared stub assigns
-// cleanly. The engine calls each slot with its own typed vtable.
 typedef struct {
   void *CreateLEDDevice;
   void *CreateVibraDevice;
@@ -147,6 +143,32 @@ typedef struct {
   SLresult (*GetPositionUpdatePeriod)(void *self, SLuint32 *p);
 } SLPlayItf_;
 
+typedef void (*slPlayCallback)(void *caller, void *pContext, SLuint32 event);
+
+#define SL_PLAYEVENT_HEADATEND 0x00000001u
+
+typedef void (*slPrefetchCallback)(void *caller, void *pContext, SLuint32 event);
+
+#define SL_PREFETCHSTATUS_SUFFICIENTDATA 3
+#define SL_PREFETCHEVENT_STATUSCHANGE    0x01u
+#define SL_PREFETCHEVENT_FILLLEVELCHANGE 0x02u
+
+typedef struct {
+  SLresult (*GetPrefetchStatus)(void *self, SLuint32 *pStatus);
+  SLresult (*GetFillLevel)(void *self, SLuint32 *pLevel);
+  SLresult (*RegisterCallback)(void *self, slPrefetchCallback cb, void *ctx);
+  SLresult (*SetCallbackEventsMask)(void *self, SLuint32 mask);
+  SLresult (*GetCallbackEventsMask)(void *self, SLuint32 *pMask);
+  SLresult (*SetFillUpdatePeriod)(void *self, SLuint32 period);
+  SLresult (*GetFillUpdatePeriod)(void *self, SLuint32 *pPeriod);
+} SLPrefetchStatusItf_;
+
+typedef struct {
+  SLresult (*SetPosition)(void *self, SLuint32 pos, SLuint32 seekMode);
+  SLresult (*SetLoop)(void *self, SLboolean enable, SLuint32 startPos, SLuint32 endPos);
+  SLresult (*GetLoop)(void *self, SLboolean *pEnable, SLuint32 *pStart, SLuint32 *pEnd);
+} SLSeekItf_;
+
 typedef struct {
   SLresult (*Enqueue)(void *self, const void *pBuffer, SLuint32 size);
   SLresult (*Clear)(void *self);
@@ -166,8 +188,6 @@ typedef struct {
   SLresult (*GetStereoPosition)(void *self, SLint32 *p);
 } SLVolumeItf_;
 
-// SLPlaybackRateItf (Chaos Rings 3 requests it for pitch-shifted SE). We don't
-// resample, so SetRate is accepted but ignored; the spec method order matters.
 typedef struct {
   SLresult (*SetRate)(void *self, SLint16 rate);
   SLresult (*GetRate)(void *self, SLint16 *p);
@@ -177,10 +197,6 @@ typedef struct {
   SLresult (*GetRateRange)(void *self, SLuint8 i, SLint16 *min, SLint16 *max, SLint16 *step, SLuint32 *prop);
 } SLPlaybackRateItf_;
 
-// SLAndroidConfigurationItf -- CR3 requests it with req=SL_BOOLEAN_TRUE at
-// CreateAudioPlayer, so it MUST be obtainable or the engine aborts the player
-// (the symptom: a player is created but never set PLAYING / never enqueues).
-// It only uses SetConfiguration (stream type / usage), which we can ignore.
 typedef struct {
   SLresult (*SetConfiguration)(void *self, const void *key, const void *value, SLuint32 valueSize);
   SLresult (*GetConfiguration)(void *self, const void *key, SLuint32 *pValueSize, void *value);
@@ -188,15 +204,9 @@ typedef struct {
   SLresult (*ReleaseJavaProxy)(void *self, SLuint32 proxyType);
 } SLAndroidConfigurationItf_;
 
-// --- objects ----------------------------------------------------------------
+/* Objects. */
 
 #define MAX_PLAYERS 64
-// FMOD's OpenSL output enqueues N = (dspNumBuffers*dspBufferLength)/framesPerBuffer
-// buffers up front (see libunity +0xce697c) before the first callback drains any.
-// If the queue fills, bq_Enqueue returns an error and FMOD aborts the player with
-// its generic "internal" error (33). With a 256-frame period and typical DSP
-// buffer totals N is ~8-32, but keep the ring comfortably larger so a big baked
-// dspBufferLength can't overflow it.
 #define BQ_SLOTS 256
 
 typedef struct {
@@ -211,6 +221,8 @@ typedef struct Player {
   const SLVolumeItf_ *vol_vt;
   const SLPlaybackRateItf_ *rate_vt;
   const SLAndroidConfigurationItf_ *config_vt;
+  const SLSeekItf_   *seek_vt;
+  const SLPrefetchStatusItf_ *prefetch_vt;
 
   int in_use;
   int channels;
@@ -229,8 +241,36 @@ typedef struct Player {
   int q_head, q_tail; // count = (tail - head + N) % N
   // currently draining buffer
   const uint8_t *cur;
-  SLuint32 cur_size, cur_pos;
+  SLuint32 cur_size;
   double cur_fpos; // fractional sample index into cur (for rate conversion)
+  /* Playback rate in per-mille (1000 == normal), set through SL_IID_PLAYBACKRATE.
+   * Sonic Jump imports that interface, so it does vary SFX pitch -- games use it
+   * so a sound triggered repeatedly (rings, jumps) does not sound identical
+   * every time. Leaving SetRate a no-op is audible: every effect plays at a
+   * fixed pitch. Read without a lock; a torn read is impossible for a 16-bit
+   * aligned store and the worst case is one block at the previous rate. */
+  SLint16 play_rate;
+
+  /* Decoded-file source (SL_DATALOCATOR_ANDROIDFD). Instead of waiting to be
+   * fed by the engine, the player owns its whole PCM buffer and re-arms itself
+   * from the start each pass. */
+  int       is_decoded;
+  int16_t  *own_pcm;
+  SLuint32  own_bytes;
+  size_t    total_frames;
+  int       loop;
+  int       finished;
+  SLuint32  state;      /* last SL_PLAYSTATE_* requested, reported verbatim */
+
+  /* SLPlayItf callback, used to report SL_PLAYEVENT_HEADATEND. */
+  slPlayCallback play_cb;
+  void          *play_cb_ctx;
+  SLuint32       play_events;
+
+  slPrefetchCallback prefetch_cb;
+  void              *prefetch_cb_ctx;
+  SLuint32           prefetch_events;
+  int                prefetch_announced;
 
   SDL_mutex *lock;
 } Player;
@@ -247,7 +287,19 @@ typedef struct {
 #define CONTAINER(ptr, type, member) \
   ((type *)((char *)(ptr) - offsetof(type, member)))
 
-// --- global SDL device + player registry ------------------------------------
+/* SDL audio state. */
+
+static int g_decoded_live;
+/* Audio diagnostics. "No sound" has several very different causes and they
+ * are indistinguishable from outside: the device may not be open, the callback
+ * may not be firing, the mixer may be running but summing silence because no
+ * voice is playing, or it may be producing samples that never reach the
+ * speaker. These counters separate those cases in one heartbeat line. */
+unsigned sj_n_audio_cb;      /* SDL callback invocations */
+unsigned sj_n_enqueued;      /* buffers handed to buffer-queue players */
+unsigned sj_audio_peak;      /* peak |sample| in the most recent buffer */
+unsigned sj_n_voices_live;   /* voices that contributed to the last buffer */
+unsigned sj_n_music_frames;  /* frames pulled from the music source */
 
 static SDL_AudioDeviceID g_dev = 0;
 static int g_dev_rate = 44100;
@@ -255,25 +307,12 @@ static Player *g_players[MAX_PLAYERS];
 static int g_player_count = 0;
 static SDL_mutex *g_reg_lock = NULL;
 
-#define MOVIE_RING_FRAMES 65536
-static SDL_mutex *g_movie_lock = NULL;
-static int16_t *g_movie_pcm = NULL;
-static int g_movie_active = 0;
-static int g_movie_paused = 0;
-static int g_movie_head = 0;
-static int g_movie_count = 0;
-static uint64_t g_movie_samples_queued = 0;
-static uint64_t g_movie_samples_played = 0;
-
 static float mb_to_linear(SLmillibel mb) {
   if (mb <= -9600) return 0.0f;
   return powf(10.0f, (float)mb / 2000.0f); // 100 mB = 1 dB
 }
 
-// Read one sample (at sample-index k within the buffer) and return it scaled to
-// signed-16-bit range, regardless of the source format. The shim's accumulator
-// and SDL device are S16; FMOD's master output player can be 16-bit int, 32-bit
-// int, or 32-bit float, so normalise here.
+// Convert supported PCM formats to signed 16-bit range.
 static inline int32_t read_sample_s16(const void *buf, long k, int sbytes, int is_float) {
   if (is_float) {
     float f = ((const float *)buf)[k];
@@ -285,22 +324,21 @@ static inline int32_t read_sample_s16(const void *buf, long k, int sbytes, int i
   return (int32_t)((const int16_t *)buf)[k];  // S16
 }
 
-// mix one playing player into the S16 stereo accumulator (int32 to avoid clip).
-// cur/cur_pos are touched only by this (audio) thread, so they need no lock;
-// only the buffer queue is shared with Enqueue. Critically, the engine's
-// completion callback is fired WITHOUT our lock held -- Android's contract --
-// otherwise the engine's mixer thread (holding its own mutex, calling Enqueue
-// which wants our lock) deadlocks against us.
-static void mix_player(Player *p, int32_t *acc, int frames) {
+/* Mix one player. Returns 1 if a decoded source just reached its end, so the
+ * caller can fire SL_PLAYEVENT_HEADATEND after dropping the registry lock --
+ * cocos destroys the player from that callback, and doing it mid-iteration
+ * would tear the player down underneath this loop. */
+static int mix_player(Player *p, int32_t *acc, int frames) {
+  int hit_end = 0;
   if (!p->playing)
-    return;
+    return 0;
 
-  // A playing player with nothing queued is a finished one-shot SE the engine
-  // fired and never Destroy'd; count the dry callbacks so alloc can recycle it.
+  // Track finished one-shot players for recycling.
   SDL_LockMutex(p->lock);
-  const int dry = (!p->cur) && (p->q_head == p->q_tail);
+  const int dry = p->is_decoded ? p->finished
+                                : ((!p->cur) && (p->q_head == p->q_tail));
   SDL_UnlockMutex(p->lock);
-  if (dry) { if (p->drained < (1 << 20)) p->drained++; return; }
+  if (dry) { if (p->drained < (1 << 20)) p->drained++; return 0; }
   p->drained = 0;
 
   const float g = p->gain;
@@ -308,27 +346,34 @@ static void mix_player(Player *p, int32_t *acc, int frames) {
   const int sbytes = p->sbytes > 0 ? p->sbytes : 2;    // bytes per sample
   const int is_float = p->is_float;
   const int bps = stereo ? sbytes * 2 : sbytes;        // bytes per input frame
-  // resample the player's own rate to the device rate (players come in at 22050
-  // AND 44100; without this, off-rate voices play at the wrong speed/pitch).
-  const double ratio = g_dev_rate > 0 ? (double)p->rate / (double)g_dev_rate : 1.0;
+  // Resample each player to the device rate, scaled by its playback rate.
+  const int rate_pm = p->play_rate ? p->play_rate : 1000;
+  const double ratio = (g_dev_rate > 0 ? (double)p->rate / (double)g_dev_rate : 1.0)
+                     * ((double)rate_pm / 1000.0);
 
   for (int i = 0; i < frames; i++) {
-    // ensure cur holds a buffer whose integer sample index covers cur_fpos,
-    // carrying the fractional remainder across buffer boundaries.
+    // Carry fractional sample positions across buffers.
     for (;;) {
       if (!p->cur) {
-        SDL_LockMutex(p->lock);
-        const int have = (p->q_head != p->q_tail);
-        BQBuffer b = { NULL, 0 };
-        if (have) {
-          b = p->q[p->q_head];
-          p->q_head = (p->q_head + 1) % BQ_SLOTS;
+        if (p->is_decoded) {
+          if (p->finished)
+            return hit_end;         // played out; rest of the block is silent
+          p->cur      = (const uint8_t *)p->own_pcm;
+          p->cur_size = p->own_bytes;
+        } else {
+          SDL_LockMutex(p->lock);
+          const int have = (p->q_head != p->q_tail);
+          BQBuffer b = { NULL, 0 };
+          if (have) {
+            b = p->q[p->q_head];
+            p->q_head = (p->q_head + 1) % BQ_SLOTS;
+          }
+          SDL_UnlockMutex(p->lock);
+          if (!have)
+            return hit_end; // underrun: rest of the block stays silent
+          p->cur = b.data;
+          p->cur_size = b.size;
         }
-        SDL_UnlockMutex(p->lock);
-        if (!have)
-          return; // underrun: rest of the block stays silent
-        p->cur = b.data;
-        p->cur_size = b.size;
       }
       const long n = (long)(p->cur_size / (SLuint32)bps);
       if (n > 0 && (long)p->cur_fpos < n)
@@ -337,16 +382,28 @@ static void mix_player(Player *p, int32_t *acc, int frames) {
       p->cur_fpos -= (double)n;
       if (p->cur_fpos < 0.0) p->cur_fpos = 0.0;
       p->cur = NULL;
-      if (p->cb) {
-        static int once = 0;
-        if (!once) { once = 1; debugPrintf("[fmod] OpenSL buffer-queue callback firing -> FMOD mixer is producing PCM\n"); }
+      if (p->is_decoded) {
+        /* Looping re-arms from the top on the next pass; otherwise this
+         * source is done and the end is reported once, after the lock. */
+        if (!p->loop) {
+          p->finished = 1;
+          p->playing  = 0;
+          p->state    = SL_PLAYSTATE_STOPPED;
+          hit_end     = 1;
+        }
+      } else if (p->cb) {
         p->cb(&p->bq_vt, p->cb_ctx);
       }
     }
 
     const long n = (long)(p->cur_size / (SLuint32)bps);
-    const long idx = (long)p->cur_fpos;
-    const double frac = p->cur_fpos - (double)idx;
+    /* p->cur_fpos can be moved by seek_SetPosition() from another thread
+     * between the bounds test above and this read. Clamp: a momentary glitch
+     * on a seek is acceptable, reading outside the buffer is not. */
+    long idx = (long)p->cur_fpos;
+    double frac = p->cur_fpos - (double)idx;
+    if (idx < 0)      { idx = 0;     frac = 0.0; }
+    else if (idx >= n){ idx = n - 1; frac = 0.0; }
     const void *s = p->cur;
     int32_t l, r;
     if (stereo) {
@@ -366,37 +423,37 @@ static void mix_player(Player *p, int32_t *acc, int frames) {
     acc[i * 2 + 1] += (int32_t)(r * g);
     p->cur_fpos += ratio;
   }
+  return hit_end;
 }
 
-static void mix_movie(int32_t *acc, int frames) {
-  if (!g_movie_lock)
-    return;
+/* --- music mix hook (sonicjump_nx) ------------------------------------------
+ * Sonic Jump's soundtrack is decoded by sj_music.c, but it must not open its
+ * own audio device: opensles.c already owns the one SDL output, and a second
+ * device would either fail to open or fight this one for the mixer. So the
+ * music source is pulled from inside this callback and summed into the same
+ * accumulator as the SFX voices, giving one output and one clock.
+ * ------------------------------------------------------------------------ */
+static sl_music_fn g_music_fn;
+static void       *g_music_ctx;
 
-  SDL_LockMutex(g_movie_lock);
-  if (!g_movie_active || g_movie_paused || !g_movie_pcm) {
-    SDL_UnlockMutex(g_movie_lock);
-    return;
-  }
-
-  const int n = g_movie_count < frames ? g_movie_count : frames;
-  for (int i = 0; i < n; i++) {
-    const int idx = (g_movie_head + i) % MOVIE_RING_FRAMES;
-    acc[i * 2 + 0] += g_movie_pcm[idx * 2 + 0];
-    acc[i * 2 + 1] += g_movie_pcm[idx * 2 + 1];
-  }
-  g_movie_head = (g_movie_head + n) % MOVIE_RING_FRAMES;
-  g_movie_count -= n;
-  g_movie_samples_played += (uint64_t)n;
-  SDL_UnlockMutex(g_movie_lock);
+void opensles_set_music_source(sl_music_fn fn, void *ctx) {
+  /* Callable before slCreateEngine: sj_music_init registers itself during
+   * startup, well before the game creates its engine, and g_reg_lock does not
+   * exist yet at that point. SDL_LockMutex(NULL) merely fails, but relying on
+   * that is not something to leave in place. */
+  if (!g_reg_lock) g_reg_lock = SDL_CreateMutex();
+  SDL_LockMutex(g_reg_lock);
+  g_music_fn = fn;
+  g_music_ctx = ctx;
+  SDL_UnlockMutex(g_reg_lock);
 }
+
+int opensles_output_rate(void) { return g_dev_rate ? g_dev_rate : 48000; }
 
 static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
   (void)ud;
 
-  // The engine's completion callback (fired from here via mix_player) reads its
-  // stack-guard from tpidr_el0+0x28; SDL's audio thread never set that up. Give
-  // this thread its OWN bionic TLS block (single audio thread, so static is fine
-  // and persists for its lifetime).
+  // Native callbacks require bionic TLS on the SDL audio thread.
   static uint8_t audio_tls[BIONIC_TLS_SIZE] __attribute__((aligned(16)));
   static int tls_ready = 0;
   if (!tls_ready) { install_bionic_tls(audio_tls); tls_ready = 1; }
@@ -406,42 +463,77 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
   if (frames > 8192) { memset(stream, 0, len); return; }
   memset(acc, 0, frames * 2 * sizeof(int32_t));
 
+  /* Snapshot rather than keep the Player pointer: cocos destroys the player
+   * from this callback, so reading its fields after the lock is released is a
+   * window onto freed memory. */
+  struct { slPlayCallback cb; void *ctx; const void *caller; } ended[MAX_PLAYERS];
+  int n_ended = 0;
+
+  sj_n_audio_cb++;
+  sj_n_voices_live = 0;
+
   SDL_LockMutex(g_reg_lock);
-  for (int i = 0; i < g_player_count; i++)
-    if (g_players[i] && g_players[i]->in_use)
-      mix_player(g_players[i], acc, frames);
+  for (int i = 0; i < g_player_count; i++) {
+    Player *q = g_players[i];
+    if (!q || !q->in_use) continue;
+    if (q->state == SL_PLAYSTATE_PLAYING) sj_n_voices_live++;
+    if (mix_player(q, acc, frames) && n_ended < MAX_PLAYERS &&
+        q->play_cb && (q->play_events & SL_PLAYEVENT_HEADATEND)) {
+      ended[n_ended].cb     = q->play_cb;
+      ended[n_ended].ctx    = q->play_cb_ctx;
+      ended[n_ended].caller = &q->play_vt;
+      n_ended++;
+    }
+  }
+
+  /* Music, summed into the same accumulator as the voices above. Held under
+   * g_reg_lock so a track change cannot swap the source mid-buffer. */
+  if (g_music_fn) {
+    static int16_t mus[8192 * 2];
+    int got = g_music_fn(g_music_ctx, mus, frames);
+    sj_n_music_frames += (unsigned)got;
+    for (int i = 0; i < got * 2; i++) acc[i] += mus[i];
+  }
+
+  /* Peak of the mixed result. Zero here with the callback firing means the
+   * mixer ran and summed nothing -- a source problem, not a device problem. */
+  {
+    int peak = 0;
+    for (int i = 0; i < frames * 2; i++) {
+      int a = acc[i] < 0 ? -acc[i] : acc[i];
+      if (a > peak) peak = a;
+    }
+    sj_audio_peak = (unsigned)peak;
+  }
   SDL_UnlockMutex(g_reg_lock);
 
-  mix_movie(acc, frames);
+  for (int i = 0; i < n_ended; i++)
+    ended[i].cb((void *)ended[i].caller, ended[i].ctx, SL_PLAYEVENT_HEADATEND);
 
   int16_t *out = (int16_t *)stream;
-  int32_t peak = 0;
   for (int i = 0; i < frames * 2; i++) {
     int32_t v = acc[i];
     if (v > 32767) v = 32767;
     else if (v < -32768) v = -32768;
     out[i] = (int16_t)v;
-    int32_t a = v < 0 ? -v : v;
-    if (a > peak) peak = a;
-  }
-  if (peak > 64) {
-    static int once = 0;
-    if (!once) { once = 1; debugPrintf("[fmod] OpenSL: first non-silent audio to device (peak=%d) -- SOUND IS ON\n", peak); }
   }
 }
 
-static void ensure_device(int rate) {
-  (void)rate; // players run at mixed rates (22050/44100); open at the Switch's
-              // native 48000 and resample each player in mix_player instead of
-              // letting the first player pin the device rate.
+static void ensure_device(void) {
   if (!g_reg_lock)
     g_reg_lock = SDL_CreateMutex();
   if (g_dev)
     return;
+
+  /* Both failure paths used to return silently, which made "no sound" and
+   * "no audio device" indistinguishable -- the log showed players being
+   * created and a mixer running while nothing was ever opened. Say what
+   * happened. */
   if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-    debugPrintf("opensles: SDL audio init failed: %s\n", SDL_GetError());
+    debugLogNote("[sl] SDL_InitSubSystem(AUDIO) FAILED: %s\n", SDL_GetError());
     return;
   }
+
   SDL_AudioSpec want, have;
   SDL_zero(want);
   want.freq = 48000;
@@ -449,178 +541,39 @@ static void ensure_device(int rate) {
   want.channels = 2;
   want.samples = 1024;
   want.callback = audio_callback;
-  g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+
+  /* Allow SDL to hand back a different rate or buffer size: the mixer
+   * resamples per voice anyway, and refusing a valid device because it chose
+   * 44100 would be silly. Format and channel count are NOT negotiable -- the
+   * mixer writes interleaved S16 stereo. */
+  g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have,
+                              SDL_AUDIO_ALLOW_FREQUENCY_CHANGE |
+                              SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
   if (!g_dev) {
-    debugPrintf("opensles: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+    debugLogNote("[sl] SDL_OpenAudioDevice FAILED: %s\n", SDL_GetError());
     return;
   }
+  if (have.format != AUDIO_S16SYS || have.channels != 2) {
+    debugLogNote("[sl] device gave format=0x%04x channels=%d, expected S16 "
+                 "stereo; closing\n", (unsigned)have.format, have.channels);
+    SDL_CloseAudioDevice(g_dev);
+    g_dev = 0;
+    return;
+  }
+
   g_dev_rate = have.freq;
-  debugPrintf("[fmod] SDL device opened: freq=%d channels=%d format=0x%04x (asked 48000/2/S16)\n",
-              have.freq, have.channels, have.format);
+  debugLogNote("[sl] audio device open: %d Hz, %d ch, %d-frame buffer "
+               "(driver \"%s\")\n",
+               have.freq, have.channels, have.samples,
+               SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
   SDL_PauseAudioDevice(g_dev, 0);
 }
 
-int opensles_movie_begin(int requested_rate) {
-  if (!g_movie_lock)
-    g_movie_lock = SDL_CreateMutex();
-  if (!g_movie_pcm)
-    g_movie_pcm = calloc(MOVIE_RING_FRAMES * 2, sizeof(int16_t));
-  if (!g_movie_lock || !g_movie_pcm)
-    return 0;
-
-  ensure_device(requested_rate > 0 ? requested_rate : 44100);
-  if (!g_dev)
-    return 0;
-
-  SDL_LockMutex(g_movie_lock);
-  g_movie_active = 1;
-  g_movie_paused = 1;
-  g_movie_head = 0;
-  g_movie_count = 0;
-  g_movie_samples_queued = 0;
-  g_movie_samples_played = 0;
-  SDL_UnlockMutex(g_movie_lock);
-  return g_dev_rate;
-}
-
-int opensles_movie_queue(const int16_t *pcm, int frames) {
-  int done = 0;
-  while (done < frames) {
-    if (!g_movie_lock)
-      return done;
-
-    SDL_LockMutex(g_movie_lock);
-    if (!g_movie_active || !g_movie_pcm) {
-      SDL_UnlockMutex(g_movie_lock);
-      return done;
-    }
-
-    const int space = MOVIE_RING_FRAMES - g_movie_count;
-    int n = frames - done;
-    if (n > space)
-      n = space;
-    for (int i = 0; i < n; i++) {
-      const int idx = (g_movie_head + g_movie_count + i) % MOVIE_RING_FRAMES;
-      g_movie_pcm[idx * 2 + 0] = pcm[(done + i) * 2 + 0];
-      g_movie_pcm[idx * 2 + 1] = pcm[(done + i) * 2 + 1];
-    }
-    g_movie_count += n;
-    g_movie_samples_queued += (uint64_t)n;
-    SDL_UnlockMutex(g_movie_lock);
-
-    done += n;
-    if (done < frames)
-      SDL_Delay(2);
-  }
-  return done;
-}
-
-void opensles_movie_set_paused(int paused) {
-  if (!g_movie_lock)
-    return;
-  SDL_LockMutex(g_movie_lock);
-  if (g_movie_active)
-    g_movie_paused = paused != 0;
-  SDL_UnlockMutex(g_movie_lock);
-}
-
-uint64_t opensles_movie_samples_queued(void) {
-  uint64_t ret = 0;
-  if (!g_movie_lock)
-    return 0;
-  SDL_LockMutex(g_movie_lock);
-  ret = g_movie_samples_queued;
-  SDL_UnlockMutex(g_movie_lock);
-  return ret;
-}
-
-uint64_t opensles_movie_samples_played(void) {
-  uint64_t ret = 0;
-  if (!g_movie_lock)
-    return 0;
-  SDL_LockMutex(g_movie_lock);
-  ret = g_movie_samples_played;
-  SDL_UnlockMutex(g_movie_lock);
-  return ret;
-}
-
-int opensles_movie_buffered_frames(void) {
-  int ret = 0;
-  if (!g_movie_lock)
-    return 0;
-  SDL_LockMutex(g_movie_lock);
-  ret = g_movie_count;
-  SDL_UnlockMutex(g_movie_lock);
-  return ret;
-}
-
-void opensles_movie_end(void) {
-  if (!g_movie_lock)
-    return;
-  SDL_LockMutex(g_movie_lock);
-  g_movie_active = 0;
-  g_movie_paused = 0;
-  g_movie_head = 0;
-  g_movie_count = 0;
-  SDL_UnlockMutex(g_movie_lock);
-}
-
-// --- FMOD (Unity native audio) output sink ----------------------------------
-// Unity's Android audio backend is FMOD's AudioTrack driver. Its Java run()
-// loop never executes here (no JVM), so jni_fake drives fmodProcess on a native
-// thread and pushes the drained PCM into this dedicated, queue-mode SDL device.
-// Kept separate from g_dev (the OpenSL software mixer, which a Unity title never
-// opens) so the two paths can't interfere.
-
-static SDL_AudioDeviceID g_fmod_dev = 0;
-static int g_fmod_dev_rate = 0;
-
-int audio_fmod_open(int rate, int channels) {
-  if (g_fmod_dev)
-    return g_fmod_dev_rate;
-  if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-    debugPrintf("[fmod] SDL audio init failed: %s\n", SDL_GetError());
-    return 0;
-  }
-  if (rate <= 0)     rate = 48000;
-  if (channels <= 0) channels = 2;
-  SDL_AudioSpec want, have;
-  SDL_zero(want);
-  want.freq     = rate;
-  want.format   = AUDIO_S16SYS;
-  want.channels = (Uint8)channels;
-  want.samples  = 1024;
-  want.callback = NULL; // queue mode: we push via SDL_QueueAudio
-  g_fmod_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have,
-                                   SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-  if (!g_fmod_dev) {
-    debugPrintf("[fmod] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-    return 0;
-  }
-  g_fmod_dev_rate = have.freq;
-  debugPrintf("[fmod] output device opened: %d Hz, %d ch (asked %d Hz)\n",
-              have.freq, have.channels, rate);
-  SDL_PauseAudioDevice(g_fmod_dev, 0);
-  return g_fmod_dev_rate;
-}
-
-// Append PCM (S16, interleaved) to the device queue. Returns currently queued
-// bytes after the append, so the caller can pace itself to realtime.
-uint32_t audio_fmod_write(const void *pcm, int bytes) {
-  if (!g_fmod_dev || bytes <= 0)
-    return g_fmod_dev ? SDL_GetQueuedAudioSize(g_fmod_dev) : 0;
-  SDL_QueueAudio(g_fmod_dev, pcm, (Uint32)bytes);
-  return SDL_GetQueuedAudioSize(g_fmod_dev);
-}
-
-uint32_t audio_fmod_queued(void) {
-  return g_fmod_dev ? SDL_GetQueuedAudioSize(g_fmod_dev) : 0;
-}
-
-// --- buffer queue interface -------------------------------------------------
+/* Buffer queue. */
 
 static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   Player *p = CONTAINER(self, Player, bq_vt);
+  sj_n_enqueued++;
   SDL_LockMutex(p->lock);
   const int next = (p->q_tail + 1) % BQ_SLOTS;
   if (next == p->q_head) { // full
@@ -639,7 +592,7 @@ static SLresult bq_Clear(void *self) {
   SDL_LockMutex(p->lock);
   p->q_head = p->q_tail = 0;
   p->cur = NULL;
-  p->cur_pos = p->cur_size = 0;
+  p->cur_size = 0;
   p->cur_fpos = 0.0;
   SDL_UnlockMutex(p->lock);
   return SL_RESULT_SUCCESS;
@@ -670,43 +623,221 @@ static const SLBufferQueueItf_ bq_vtable = {
   bq_Enqueue, bq_Clear, bq_GetState, bq_RegisterCallback,
 };
 
-// --- play interface ---------------------------------------------------------
+/* Playback. */
 
+static void pf_announce_ready(Player *p);
+
+/* STOPPED, PAUSED and PLAYING are three different things, and collapsing them
+ * to a single "playing" flag got all three of them wrong for a decoded source:
+ *
+ *   - Stopping is defined to rewind; pausing is defined not to. Both simply
+ *     cleared the flag, so a stop followed by a play resumed from the middle
+ *     of the track instead of restarting it.
+ *   - Replaying a source that had already played out did nothing at all. The
+ *     mixer skips a finished decoded source, so it stayed silent for ever
+ *     while cocos believed it was playing.
+ *   - GetPlayState reported a paused player as STOPPED, which is what cocos
+ *     polls to decide a sound has ended. */
 static SLresult play_SetPlayState(void *self, SLuint32 state) {
   Player *p = CONTAINER(self, Player, play_vt);
   SDL_LockMutex(p->lock);
-  p->playing = (state == SL_PLAYSTATE_PLAYING);
-  SDL_UnlockMutex(p->lock);
-  if (p->playing) {
-    static int once = 0;
-    if (!once) { once = 1; debugPrintf("[fmod] OpenSL SetPlayState(PLAYING) -> output running\n"); }
+
+  switch (state) {
+    case SL_PLAYSTATE_STOPPED:
+      p->playing = 0;
+      if (p->is_decoded) {          /* rewind */
+        p->cur = NULL;
+        p->cur_fpos = 0.0;
+        p->finished = 0;
+        p->drained = 0;
+      }
+      break;
+
+    case SL_PLAYSTATE_PAUSED:
+      p->playing = 0;               /* position retained deliberately */
+      break;
+
+    case SL_PLAYSTATE_PLAYING:
+      if (p->is_decoded && p->finished) {
+        p->cur = NULL;              /* played out: start again from the top */
+        p->cur_fpos = 0.0;
+        p->finished = 0;
+        p->drained = 0;
+      }
+      p->playing = 1;
+      break;
+
+    default:
+      break;
   }
+  p->state = state;
+  SDL_UnlockMutex(p->lock);
+
+  pf_announce_ready(p);
   return SL_RESULT_SUCCESS;
 }
 static SLresult play_GetPlayState(void *self, SLuint32 *pState) {
   Player *p = CONTAINER(self, Player, play_vt);
-  if (pState) *pState = p->playing ? SL_PLAYSTATE_PLAYING : SL_PLAYSTATE_STOPPED;
+  if (!pState) return SL_RESULT_PARAMETER_INVALID;
+  /* Report what was asked for, except that a source which has played out is
+   * genuinely stopped however it was last set. */
+  if (p->is_decoded && p->finished)      *pState = SL_PLAYSTATE_STOPPED;
+  else if (p->state)                     *pState = p->state;
+  else                                   *pState = SL_PLAYSTATE_STOPPED;
   return SL_RESULT_SUCCESS;
 }
 static SLresult play_ret0_u32(void *self, SLuint32 *p) { (void)self; if (p) *p = 0; return SL_RESULT_SUCCESS; }
 static SLresult play_ok_u32(void *self, SLuint32 v) { (void)self; (void)v; return SL_RESULT_SUCCESS; }
 static SLresult play_ok(void *self) { (void)self; return SL_RESULT_SUCCESS; }
-static SLresult play_RegisterCallback(void *self, void *cb, void *ctx) { (void)self; (void)cb; (void)ctx; return SL_RESULT_SUCCESS; }
+/* Registering this was previously a no-op. A decoded source has to report
+ * SL_PLAYEVENT_HEADATEND or cocos never learns the track finished, never
+ * releases the player, and never starts the next one. */
+static SLresult play_RegisterCallback(void *self, void *cb, void *ctx) {
+  Player *p = CONTAINER(self, Player, play_vt);
+  p->play_cb = (slPlayCallback)cb;
+  p->play_cb_ctx = ctx;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult play_SetCallbackEventsMask(void *self, SLuint32 mask) {
+  Player *p = CONTAINER(self, Player, play_vt);
+  p->play_events = mask;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult play_GetCallbackEventsMask(void *self, SLuint32 *pMask) {
+  Player *p = CONTAINER(self, Player, play_vt);
+  if (pMask) *pMask = p->play_events;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult play_GetDuration(void *self, SLuint32 *pMsec) {
+  Player *p = CONTAINER(self, Player, play_vt);
+  if (!pMsec) return SL_RESULT_PARAMETER_INVALID;
+  *pMsec = (p->is_decoded && p->rate > 0)
+             ? (SLuint32)((p->total_frames * 1000ull) / (unsigned)p->rate)
+             : 0;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult play_GetPosition(void *self, SLuint32 *pMsec) {
+  Player *p = CONTAINER(self, Player, play_vt);
+  if (!pMsec) return SL_RESULT_PARAMETER_INVALID;
+  *pMsec = (p->is_decoded && p->rate > 0)
+             ? (SLuint32)(((uint64_t)p->cur_fpos * 1000ull) / (unsigned)p->rate)
+             : 0;
+  return SL_RESULT_SUCCESS;
+}
 
 static const SLPlayItf_ play_vtable = {
-  play_SetPlayState, play_GetPlayState, play_ret0_u32, play_ret0_u32,
-  play_RegisterCallback, play_ok_u32, play_ret0_u32, play_ok_u32,
+  play_SetPlayState, play_GetPlayState, play_GetDuration, play_GetPosition,
+  play_RegisterCallback, play_SetCallbackEventsMask, play_GetCallbackEventsMask, play_ok_u32,
   play_ok, play_ret0_u32, play_ok_u32, play_ret0_u32,
 };
 
-// --- volume interface -------------------------------------------------------
+/* Seek: cocos loops background music through SetLoop rather than by
+ * re-issuing the sound. */
+static SLresult seek_SetPosition(void *self, SLuint32 pos, SLuint32 mode) {
+  Player *p = CONTAINER(self, Player, seek_vt);
+  (void)mode;
+  if (!p->is_decoded || p->rate <= 0) return SL_RESULT_SUCCESS;
+  SDL_LockMutex(p->lock);
+  double frame = ((double)pos / 1000.0) * (double)p->rate;
+  if (frame < 0) frame = 0;
+  if (frame > (double)p->total_frames) frame = (double)p->total_frames;
+  p->cur      = (const uint8_t *)p->own_pcm;
+  p->cur_size = p->own_bytes;
+  p->cur_fpos = frame;
+  p->finished = 0;
+  SDL_UnlockMutex(p->lock);
+  return SL_RESULT_SUCCESS;
+}
+static SLresult seek_SetLoop(void *self, SLboolean enable, SLuint32 start, SLuint32 end) {
+  Player *p = CONTAINER(self, Player, seek_vt);
+  (void)start; (void)end;
+  p->loop = enable ? 1 : 0;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult seek_GetLoop(void *self, SLboolean *pEnable, SLuint32 *pStart, SLuint32 *pEnd) {
+  Player *p = CONTAINER(self, Player, seek_vt);
+  if (pEnable) *pEnable = p->loop ? SL_BOOLEAN_TRUE : SL_BOOLEAN_FALSE;
+  if (pStart)  *pStart = 0;
+  if (pEnd)    *pEnd = 0;
+  return SL_RESULT_SUCCESS;
+}
+static const SLSeekItf_ seek_vtable = { seek_SetPosition, seek_SetLoop, seek_GetLoop };
+
+/* Prefetch status.
+ *
+ * UrlAudioPlayer::prepare() requests this interface. The whole file is already
+ * decoded and resident by the time the player exists, so the honest answer to
+ * every question is "buffered, nothing pending". The callback is fired once,
+ * because a caller that waits for prefetch to complete would otherwise wait
+ * forever. */
+static SLresult pf_GetPrefetchStatus(void *self, SLuint32 *pStatus) {
+  (void)self;
+  if (pStatus) *pStatus = SL_PREFETCHSTATUS_SUFFICIENTDATA;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult pf_GetFillLevel(void *self, SLuint32 *pLevel) {
+  (void)self;
+  if (pLevel) *pLevel = 1000;   /* permille: completely filled */
+  return SL_RESULT_SUCCESS;
+}
+static SLresult pf_RegisterCallback(void *self, slPrefetchCallback cb, void *ctx) {
+  Player *p = CONTAINER(self, Player, prefetch_vt);
+  p->prefetch_cb = cb;
+  p->prefetch_cb_ctx = ctx;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult pf_SetCallbackEventsMask(void *self, SLuint32 mask) {
+  Player *p = CONTAINER(self, Player, prefetch_vt);
+  p->prefetch_events = mask;
+  return SL_RESULT_SUCCESS;
+}
+
+/* Reported once, from the first SetPlayState rather than from inside
+ * SetCallbackEventsMask. Firing from the setter re-enters cocos in the middle
+ * of its own player setup, which is a needless hazard for something that only
+ * has to be said once and is true from the moment the player exists. */
+static void pf_announce_ready(Player *p) {
+  if (!p->prefetch_cb || p->prefetch_announced) return;
+  p->prefetch_announced = 1;
+  SLuint32 ev = p->prefetch_events
+                  ? p->prefetch_events
+                  : (SL_PREFETCHEVENT_STATUSCHANGE | SL_PREFETCHEVENT_FILLLEVELCHANGE);
+  p->prefetch_cb(&p->prefetch_vt, p->prefetch_cb_ctx, ev);
+}
+static SLresult pf_GetCallbackEventsMask(void *self, SLuint32 *pMask) {
+  (void)self;
+  if (pMask) *pMask = SL_PREFETCHEVENT_STATUSCHANGE | SL_PREFETCHEVENT_FILLLEVELCHANGE;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult pf_ok_u32(void *self, SLuint32 v) { (void)self; (void)v; return SL_RESULT_SUCCESS; }
+static SLresult pf_ret0_u32(void *self, SLuint32 *p) { (void)self; if (p) *p = 0; return SL_RESULT_SUCCESS; }
+
+static const SLPrefetchStatusItf_ prefetch_vtable = {
+  pf_GetPrefetchStatus, pf_GetFillLevel, pf_RegisterCallback,
+  pf_SetCallbackEventsMask, pf_GetCallbackEventsMask,
+  pf_ok_u32, pf_ret0_u32,
+};
+
+/* Last-resort table for interfaces this port does not implement. Returning
+ * NULL from GetInterface is correct by the spec, but a caller that skips the
+ * result check and dereferences anyway then jumps through address 0. Pointing
+ * at no-op stubs turns that crash into a call that does nothing. */
+static SLresult generic_noop(void *self) { (void)self; return SL_RESULT_SUCCESS; }
+static void *const generic_itf_vtable[24] = {
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+  (void *)generic_noop, (void *)generic_noop, (void *)generic_noop, (void *)generic_noop,
+};
+static const void *generic_itf = generic_itf_vtable;
+
+/* Volume. */
 
 static SLresult vol_SetVolumeLevel(void *self, SLmillibel level) {
   Player *p = CONTAINER(self, Player, vol_vt);
-  // Clamp to the valid OpenSL volume range [-9600, 0] mB before converting. CR3
-  // sometimes passes a garbage/zero-extended value (e.g. 32768) that would yield
-  // an astronomically huge gain; treat out-of-range high as 0 mB (unity/full) so
-  // the single unified-mix player is never accidentally muted or overflowed.
+  // Clamp to the OpenSL volume range before converting.
   int mb = (int)level;
   if (mb > 0) mb = 0;
   if (mb < -9600) mb = -9600;
@@ -731,26 +862,44 @@ static const SLVolumeItf_ vol_vtable = {
   vol_GetMute, vol_enable, vol_isenabled, vol_setpos, vol_getpos,
 };
 
-// --- playback rate interface (accepted but not resampled) -------------------
+/* Playback-rate properties.
+ *
+ * SL_RATEPROP_NOPITCHCORAUDIO: rate changes shift pitch. That is exactly what
+ * the resampler in mix_player does, and what a game wants for SFX variation. */
+#define SL_RATEPROP_NOPITCHCORAUDIO ((SLuint32)0x2)
 
-static SLresult rate_SetRate(void *self, SLint16 r) { (void)self; (void)r; return SL_RESULT_SUCCESS; }
-static SLresult rate_GetRate(void *self, SLint16 *p) { (void)self; if (p) *p = 1000; return SL_RESULT_SUCCESS; }
+static SLresult rate_SetRate(void *self, SLint16 r) {
+  Player *p = CONTAINER(self, Player, rate_vt);
+  /* Clamp to the range advertised by rate_GetRange. Outside it the spec says
+   * to fail rather than silently saturate, and a rate of 0 would freeze the
+   * read cursor and hang the voice forever. */
+  if (r < 500 || r > 2000) return SL_RESULT_PARAMETER_INVALID;
+  p->play_rate = r;
+  return SL_RESULT_SUCCESS;
+}
+static SLresult rate_GetRate(void *self, SLint16 *out) {
+  Player *p = CONTAINER(self, Player, rate_vt);
+  if (out) *out = p->play_rate ? p->play_rate : 1000;
+  return SL_RESULT_SUCCESS;
+}
 static SLresult rate_SetProps(void *self, SLuint32 c) { (void)self; (void)c; return SL_RESULT_SUCCESS; }
-static SLresult rate_GetProps(void *self, SLuint32 *p) { (void)self; if (p) *p = 0; return SL_RESULT_SUCCESS; }
-static SLresult rate_GetCaps(void *self, SLuint32 *p) { (void)self; if (p) *p = 0; return SL_RESULT_SUCCESS; }
+static SLresult rate_GetProps(void *self, SLuint32 *p) { (void)self; if (p) *p = SL_RATEPROP_NOPITCHCORAUDIO; return SL_RESULT_SUCCESS; }
+static SLresult rate_GetCaps(void *self, SLuint32 *p) {
+  (void)self; if (p) *p = SL_RATEPROP_NOPITCHCORAUDIO; return SL_RESULT_SUCCESS;
+}
 static SLresult rate_GetRange(void *self, SLuint8 i, SLint16 *min, SLint16 *max, SLint16 *step, SLuint32 *prop) {
   (void)self; (void)i;
-  if (min)  *min  = 500;
-  if (max)  *max  = 2000;
+  if (min) *min = 500;
+  if (max) *max = 2000;
   if (step) *step = 1;
-  if (prop) *prop = 0;
+  if (prop) *prop = SL_RATEPROP_NOPITCHCORAUDIO;
   return SL_RESULT_SUCCESS;
 }
 static const SLPlaybackRateItf_ rate_vtable = {
   rate_SetRate, rate_GetRate, rate_SetProps, rate_GetProps, rate_GetCaps, rate_GetRange,
 };
 
-// --- android configuration interface (accepted, ignored) --------------------
+/* Android configuration properties. */
 
 static SLresult cfg_SetConfiguration(void *self, const void *key, const void *value, SLuint32 sz) {
   (void)self; (void)key; (void)value; (void)sz; return SL_RESULT_SUCCESS;
@@ -767,7 +916,7 @@ static const SLAndroidConfigurationItf_ cfg_vtable = {
   cfg_SetConfiguration, cfg_GetConfiguration, cfg_AcquireJavaProxy, cfg_ReleaseJavaProxy,
 };
 
-// --- player object ----------------------------------------------------------
+/* Player object. */
 
 static SLresult player_GetInterface(void *self, const SLInterfaceID iid, void *pInterface);
 static void player_Destroy(void *self);
@@ -811,8 +960,12 @@ static SLresult player_GetInterface(void *self, const SLInterfaceID iid, void *p
     *(void **)pInterface = &p->rate_vt;
   } else if (iid == SL_IID_ANDROIDCONFIGURATION) {
     *(void **)pInterface = &p->config_vt;
+  } else if (iid == SL_IID_SEEK) {
+    *(void **)pInterface = &p->seek_vt;
+  } else if (iid == SL_IID_PREFETCHSTATUS) {
+    *(void **)pInterface = &p->prefetch_vt;
   } else {
-    *(void **)pInterface = NULL;
+    *(void **)pInterface = (void *)&generic_itf;
     return SL_RESULT_FEATURE_UNSUPPORTED;
   }
   return SL_RESULT_SUCCESS;
@@ -825,26 +978,171 @@ static void player_Destroy(void *self) {
     if (g_players[i] == p) g_players[i] = NULL;
   SDL_UnlockMutex(g_reg_lock);
   if (p->lock) SDL_DestroyMutex(p->lock);
+  if (p->is_decoded && g_decoded_live > 0) g_decoded_live--;
+  free(p->own_pcm);
   free(p);
 }
 
-// --- engine interface -------------------------------------------------------
+/* Engine. */
+
+#define SL_DATALOCATOR_ANDROIDFD 0x800007BCu
+#define SL_DATAFORMAT_MIME       0x00000001u
+typedef int64_t SLAint64;
+#define SL_DATALOCATOR_ANDROIDFD_USE_FILE_SIZE ((SLAint64)0xFFFFFFFFFFFFFFFFull)
+
+typedef struct {
+  SLuint32 locatorType;
+  SLint32  fd;
+  SLAint64 offset;
+  SLAint64 length;
+} SLDataLocator_AndroidFD;
+
+/* Pull the region the locator describes out of the descriptor and decode it.
+ * The descriptor belongs to cocos -- it closes it when the player goes away --
+ * so the file position is restored rather than left where reading finished. */
+/* Serialises descriptor reads. The file position is state shared with whoever
+ * owns the descriptor, so two decodes running at once -- the same sound
+ * started twice, or two streams together -- would seek each other's reads out
+ * from under them and both get garbage. Decodes are rare enough that a plain
+ * mutex costs nothing. */
+static SDL_mutex *g_decode_lock;
+
+static int read_and_decode_fd(const SLDataLocator_AndroidFD *loc,
+                              int16_t **pcm, size_t *frames,
+                              int *rate, int *channels) {
+  if (!loc || loc->fd < 0) return 0;
+
+  SDL_LockMutex(g_decode_lock);
+  off_t saved = lseek(loc->fd, 0, SEEK_CUR);
+
+  off_t length = (off_t)loc->length;
+  if (loc->length == SL_DATALOCATOR_ANDROIDFD_USE_FILE_SIZE || length <= 0) {
+    off_t end = lseek(loc->fd, 0, SEEK_END);
+    length = end - (off_t)loc->offset;
+  }
+  if (length <= 0 || length > (64 << 20)) {
+    debugLogNote("[sl] descriptor length %lld is not usable\n", (long long)length);
+    if (saved >= 0) lseek(loc->fd, saved, SEEK_SET);
+    SDL_UnlockMutex(g_decode_lock);
+    return 0;
+  }
+
+  uint8_t *buf = malloc((size_t)length);
+  if (!buf) {
+    debugLogNote("[sl] could not allocate %lld bytes to read the stream\n", (long long)length);
+    if (saved >= 0) lseek(loc->fd, saved, SEEK_SET);
+    SDL_UnlockMutex(g_decode_lock);
+    return 0;
+  }
+
+  lseek(loc->fd, (off_t)loc->offset, SEEK_SET);
+  size_t got = 0;
+  while (got < (size_t)length) {
+    ssize_t n = read(loc->fd, buf + got, (size_t)length - got);
+    if (n <= 0) break;
+    got += (size_t)n;
+  }
+  if (saved >= 0) lseek(loc->fd, saved, SEEK_SET);
+
+  SDL_UnlockMutex(g_decode_lock);   /* descriptor done with; decode freely */
+
+  if (got != (size_t)length) {
+    debugLogNote("[sl] short read from descriptor: %u of %lld bytes\n",
+                 (unsigned)got, (long long)length);
+    free(buf);
+    return 0;
+  }
+
+  const int ok = mp3_decode_buffer(buf, got, pcm, frames, rate, channels);
+  free(buf);
+  if (!ok)
+    debugLogNote("[sl] descriptor contents are not decodable MP3 -- staying silent\n");
+  return ok;
+}
 
 static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSource *src, SLDataSink *snk,
                                       SLuint32 numIfaces, const SLInterfaceID *ids, const SLboolean *req) {
-  (void)self; (void)snk; (void)numIfaces; (void)ids; (void)req;
+  {
+    /* The single most useful audio diagnostic: which locator/format the game
+     * asked for. cocos uses a PCM buffer queue for decoded sound effects and
+     * an Android FD source for streamed music; only the first is supported. */
+    SLuint32 srcLoc = (src && src->pLocator) ? *(SLuint32 *)src->pLocator : 0xFFFFFFFFu;
+    SLuint32 srcFmt = (src && src->pFormat)  ? *(SLuint32 *)src->pFormat  : 0xFFFFFFFFu;
+    SLuint32 snkLoc = (snk && snk->pLocator) ? *(SLuint32 *)snk->pLocator : 0xFFFFFFFFu;
+    debugLogNote("[sl] CreateAudioPlayer src=0x%X fmt=0x%X sink=0x%X\n",
+                 (unsigned)srcLoc, (unsigned)srcFmt, (unsigned)snkLoc);
+  }
+  (void)self; (void)numIfaces; (void)ids; (void)req;
   if (!pPlayer)
     return SL_RESULT_PARAMETER_INVALID;
 
+  /* Refuse sources this layer cannot possibly render.
+   *
+   * cocos hands us SL_DATALOCATOR_ANDROIDFD (0x800007BC) with
+   * SL_DATAFORMAT_MIME whenever it wants the *platform* to decode a
+   * compressed file -- either to stream it, or to decode it to PCM through a
+   * buffer-queue sink. There is no decoder here, so such a player can never
+   * produce audio and can never reach end-of-stream.
+   *
+   * Accepting it anyway was worse than useless: cocos keeps the file
+   * descriptor it obtained from AAsset_openFileDescriptor() and the player
+   * object alive until playback completes, which never happened. Every sound
+   * leaked one fd and one of the MAX_PLAYERS slots. That is why the game ran
+   * correctly for a while and then failed once enough sounds had played --
+   * the log shows 844 of these in a single session against 64 slots.
+   *
+   * Failing here lets cocos close the fd, release the player and move on. */
+  /* An SL_DATALOCATOR_ANDROIDFD source with SL_DATAFORMAT_MIME is cocos asking
+   * the platform to decode a compressed file for it -- the path it takes for
+   * anything too large to preload. Decode it here and hand the mixer a normal
+   * PCM source; see mp3_decode.c for why this rather than forcing cocos to
+   * preload. */
+  int16_t *decoded_pcm = NULL;
+  size_t   decoded_frames = 0;
+  int      decoded_rate = 0, decoded_channels = 0;
+  {
+    const SLuint32 srcLocator = (src && src->pLocator) ? *(SLuint32 *)src->pLocator : 0;
+    const SLuint32 srcFormat  = (src && src->pFormat)  ? *(SLuint32 *)src->pFormat  : 0;
+    if (srcLocator == SL_DATALOCATOR_ANDROIDFD || srcFormat == SL_DATAFORMAT_MIME) {
+      if (!config.decode_stream_audio) {
+        static int noted = 0;
+        if (!noted) { noted = 1; debugLogNote("[sl] stream decoding disabled by config\n"); }
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+      }
+      if (srcLocator != SL_DATALOCATOR_ANDROIDFD) {
+        debugLogNote("[sl] MIME source without a descriptor -- cannot decode\n");
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+      }
+      const SLDataLocator_AndroidFD *fdloc = (const SLDataLocator_AndroidFD *)src->pLocator;
+      if (!read_and_decode_fd(fdloc, &decoded_pcm, &decoded_frames,
+                              &decoded_rate, &decoded_channels))
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+  }
+  (void)snk;
+
+  {
+    static int announced = 0;
+    if (!announced) {
+      announced = 1;
+      debugLogNote("[sl] first PCM player accepted -- decoded audio path is live\n");
+    }
+  }
+
   Player *p = calloc(1, sizeof(*p));
-  if (!p)
+  if (!p) {
+    free(decoded_pcm);
     return SL_RESULT_PARAMETER_INVALID;
+  }
   p->obj_vt = &player_obj_vtable;
   p->play_vt = &play_vtable;
   p->bq_vt = &bq_vtable;
   p->vol_vt = &vol_vtable;
   p->rate_vt = &rate_vtable;
+  p->play_rate = 1000;          /* normal speed until SetRate says otherwise */
   p->config_vt = &cfg_vtable;
+  p->seek_vt = &seek_vtable;
+  p->prefetch_vt = &prefetch_vtable;
   p->in_use = 1;
   p->gain = 1.0f;
   p->channels = 2;
@@ -853,7 +1151,41 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
   p->is_float = 0;
   p->lock = SDL_CreateMutex();
 
-  if (src && src->pFormat) {
+  if (decoded_pcm) {
+    const uint64_t bytes =
+        (uint64_t)decoded_frames * (uint64_t)decoded_channels * sizeof(int16_t);
+    if (bytes > 0xF0000000ull) {
+      /* own_bytes and cur_size are SLuint32. A track this long is not real,
+       * but truncating the size the mixer reads from would be silent
+       * corruption rather than an error. */
+      debugLogNote("[sl] decoded stream is %llu MB -- too large to address\n",
+                   (unsigned long long)(bytes / 1048576));
+      free(decoded_pcm);
+      decoded_pcm = NULL;
+    }
+  }
+  if (decoded_pcm) {
+    /* Set after the defaults above, not before: they are assigned
+     * unconditionally and would otherwise clobber the decoded format. It only
+     * looked correct because this track happens to be 44100/stereo, which is
+     * exactly what the defaults say. */
+    p->is_decoded   = 1;
+    p->own_pcm      = decoded_pcm;
+    p->total_frames = decoded_frames;
+    p->own_bytes    = (SLuint32)(decoded_frames * (size_t)decoded_channels * sizeof(int16_t));
+    p->channels     = decoded_channels;
+    p->rate         = decoded_rate;
+    p->sbytes       = 2;
+    p->is_float     = 0;
+    g_decoded_live++;
+    debugLogNote("[sl] decoded source ready: %d Hz, %d ch, %u frames (%d live)\n",
+                 decoded_rate, decoded_channels, (unsigned)decoded_frames,
+                 g_decoded_live);
+    if (g_decoded_live > 4)
+      debugLogNote("[sl] WARNING: %d decoded sources alive at once -- cocos is "
+                   "not destroying them, each holds its whole PCM buffer\n",
+                   g_decoded_live);
+  } else if (src && src->pFormat) {
     const SLDataFormat_PCM *fmt = src->pFormat;
     // formatType 2 = SL_DATAFORMAT_PCM (integer); 4 = SL_ANDROID_DATAFORMAT_PCM_EX
     // (adds a trailing 'representation' field: 1=signed int, 2=float, 3=unsigned).
@@ -868,14 +1200,9 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
         p->is_float = (representation == 2);
       }
     }
-    debugPrintf("[fmod] OpenSL fmt: type=%u ch=%u rate=%uHz bits=%u container=%u -> %d-byte %s\n",
-                fmt->formatType, fmt->numChannels, p->rate, fmt->bitsPerSample,
-                fmt->containerSize, p->sbytes, p->is_float ? "float" : "int");
   }
-  debugPrintf("[fmod] OpenSL CreateAudioPlayer: %d Hz, %d ch (FMOD output player)\n",
-              p->rate, p->channels);
 
-  ensure_device(p->rate);
+  ensure_device();
 
   SDL_LockMutex(g_reg_lock);
   int slot = -1;
@@ -884,15 +1211,25 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
   if (slot < 0 && g_player_count < MAX_PLAYERS)
     slot = g_player_count++;
   if (slot < 0) {
-    // pool full: the engine never Destroys finished SEs, so reclaim one that has
-    // been playing-but-silent for >~0.8s (a live BGM re-enqueues far sooner, so
-    // it never becomes a victim). Safe to free here -- the mixer holds g_reg_lock
-    // while mixing, so it can't touch the victim concurrently.
+    // Reclaim a finished one-shot while the mixer lock is held.
     for (int i = 0; i < g_player_count; i++) {
       Player *q = g_players[i];
-      if (q && q->playing && q->drained > 40) {
+      /* Reclaiming frees the object while cocos may still hold the SLObjectItf
+       * it was handed. That is survivable for an abandoned one-shot buffer
+       * queue, which is what this rule was written for.
+       *
+       * It is NOT survivable for a decoded source. cocos keeps the player
+       * alive until its own end-of-stream callback runs and calls Destroy, so
+       * reclaiming a finished one hands it a dangling object -- and the damage
+       * appears later, somewhere unrelated. An earlier version of this did
+       * exactly that, and the decoded music player is precisely the kind that
+       * sits "finished" for a while before cocos gets round to it. */
+      const int spent = q && !q->is_decoded && q->playing && q->drained > 40;
+      if (spent) {
+        debugLogNote("[sl] reclaiming player slot %d from a drained one-shot\n", i);
         g_players[i] = NULL;
         if (q->lock) SDL_DestroyMutex(q->lock);
+        free(q->own_pcm);
         free(q);
         slot = i;
         break;
@@ -903,6 +1240,16 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
     g_players[slot] = p;
   SDL_UnlockMutex(g_reg_lock);
 
+  if (slot < 0) {
+    /* All MAX_PLAYERS slots are live and none were reclaimable. Returning
+     * success here would hand back a player the mixer never sees: silent,
+     * and leaked for the rest of the session. */
+    if (p->lock) SDL_DestroyMutex(p->lock);
+    free(p->own_pcm);   /* a decoded source owns megabytes; do not drop it here */
+    free(p);
+    return SL_RESULT_RESOURCE_ERROR;
+  }
+
   *pPlayer = &p->obj_vt;
   return SL_RESULT_SUCCESS;
 }
@@ -910,11 +1257,13 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
 static SLresult eng_CreateOutputMix(void *self, SLObjectItf *pMix, SLuint32 numIfaces,
                                     const SLInterfaceID *ids, const SLboolean *req) {
   (void)self; (void)numIfaces; (void)ids; (void)req;
+  if (!pMix)
+    return SL_RESULT_PARAMETER_INVALID;
   OutputMix *m = calloc(1, sizeof(*m));
   if (!m)
     return SL_RESULT_PARAMETER_INVALID;
   m->obj_vt = &mix_obj_vtable;
-  if (pMix) *pMix = &m->obj_vt;
+  *pMix = &m->obj_vt;
   return SL_RESULT_SUCCESS;
 }
 
@@ -955,14 +1304,17 @@ static const SLObjectItf_ engine_obj_vtable = {
   obj_Abort, simple_Destroy, obj_SetPriority, obj_GetPriority, obj_SetLOC,
 };
 
-// --- entry point ------------------------------------------------------------
+/* Entry point. */
 
 uint32_t slCreateEngine(void **pEngine, uint32_t numOptions, const void *pEngineOptions,
                         uint32_t numInterfaces, const void *pInterfaceIds,
                         const void *pInterfaceRequired) {
+  debugLogNote("[sl] slCreateEngine\n");
+  /* Created here rather than on first use: engine creation is single-threaded,
+   * whereas a lazy "if (!lock) create" would itself be a race. */
+  if (!g_decode_lock) g_decode_lock = SDL_CreateMutex();
   (void)numOptions; (void)pEngineOptions; (void)numInterfaces;
   (void)pInterfaceIds; (void)pInterfaceRequired;
-  debugPrintf("[fmod] slCreateEngine called -> OpenSL output selected\n");
   if (!g_reg_lock)
     g_reg_lock = SDL_CreateMutex();
   if (!pEngine)
@@ -977,15 +1329,12 @@ uint32_t slCreateEngine(void **pEngine, uint32_t numOptions, const void *pEngine
 }
 
 void opensles_shutdown(void) {
-  opensles_movie_end();
   if (g_dev) {
     SDL_CloseAudioDevice(g_dev);
     g_dev = 0;
   }
-  free(g_movie_pcm);
-  g_movie_pcm = NULL;
-  if (g_movie_lock) {
-    SDL_DestroyMutex(g_movie_lock);
-    g_movie_lock = NULL;
-  }
+}
+
+void opensles_ensure_output(void) {
+  ensure_device();
 }

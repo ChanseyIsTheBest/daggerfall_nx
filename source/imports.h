@@ -1,25 +1,21 @@
-/* imports.h -- .so import resolution
+/* imports.h -- the resolver table. MIT licensed.
  *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
+ * libc_shim.c is compiled in unmodified and includes this by name for
+ * dynlib_find_export, which is what backs its dlsym() shim. That matters more
+ * here than in the reference ports: this engine dlopen()s libOpenSLES.so and
+ * resolves its entire audio interface through dlsym, so this lookup is on the
+ * path to any sound at all.
  */
+#ifndef PPS_IMPORTS_H
+#define PPS_IMPORTS_H
 
-#ifndef __IMPORTS_H__
-#define __IMPORTS_H__
-
-#include <stdio.h>
-#include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "so_util.h"
 
-extern FILE *stderr_fake;
 extern DynLibFunction dynlib_functions[];
-uintptr_t dynlib_find_export(const char *name);  /* search shim table (for dlsym) */
-extern size_t dynlib_numfunctions;
+extern const size_t   dynlib_numfunctions;
 
-void update_imports(void);
-
-// relocate `mod` and resolve its imports against dynlib_functions[] (and the
-// other already-loaded modules). Used for both libc++_shared.so and libcrx.so.
-void crx_resolve_imports(so_module *mod);
+uintptr_t dynlib_find_export(const char *name);
 
 #endif

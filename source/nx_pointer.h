@@ -92,11 +92,6 @@ void nxp_draw(void);
 
 /* Queries / misc */
 int   nxp_cursor_visible(void);
-
-/* Send the UP for an in-flight touch. Call before anything that will stop the
- * pointer pump running (the software keyboard applet), or the game is left
- * holding a finger down. */
-void  nxp_release_touch(void);
 void  nxp_cursor_pos(float *x, float *y);
 float nxp_stick_speed(void);     /* current scroll rate (px/frame)          */
 float nxp_mouse_sens(void);      /* current mouse sensitivity               */

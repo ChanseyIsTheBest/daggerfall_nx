@@ -1,14 +1,4 @@
-/* opensles.h -- minimal OpenSL ES shim for the Cuore/SQEX sound layer
- *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
- *
- * libff4.so links against the Android OpenSL ES system library, which has no
- * devkitPro equivalent. We implement just enough of the object model
- * (Engine -> OutputMix / AudioPlayer with an Android simple buffer queue, plus
- * the Play and Volume interfaces) and back the buffer-queue players with a
- * single SDL2 audio device that software-mixes them.
- */
+/* Minimal OpenSL ES interface. */
 
 #ifndef __OPENSLES_H__
 #define __OPENSLES_H__
@@ -19,26 +9,16 @@ uint32_t slCreateEngine(void **pEngine, uint32_t numOptions, const void *pEngine
                         uint32_t numInterfaces, const void *pInterfaceIds,
                         const void *pInterfaceRequired);
 
+/* Pull `frames` stereo S16 frames of music into `dst`; return frames written
+ * (may be fewer, the rest is treated as silence). Called from the audio
+ * thread, so it must not block or allocate. */
+typedef int (*sl_music_fn)(void *ctx, int16_t *dst, int frames);
+void opensles_set_music_source(sl_music_fn fn, void *ctx);
+int  opensles_output_rate(void);
+
 void opensles_shutdown(void);
-
-
-int opensles_movie_begin(int requested_rate);
-int opensles_movie_queue(const int16_t *pcm, int frames);
-void opensles_movie_set_paused(int paused);
-uint64_t opensles_movie_samples_queued(void);
-uint64_t opensles_movie_samples_played(void);
-int opensles_movie_buffered_frames(void);
-void opensles_movie_end(void);
-
-// FMOD (Unity native audio) output sink -- a dedicated queue-mode SDL device
-// driven by the native fmodProcess pump in jni_fake.c.
-int      audio_fmod_open(int rate, int channels);      // returns actual device rate (0=fail)
-uint32_t audio_fmod_write(const void *pcm, int bytes); // returns queued bytes after append
-uint32_t audio_fmod_queued(void);                      // currently queued bytes
-
-// interface-id tokens referenced by libff4.so relocations. Each is a unique
-// non-NULL sentinel (self-addressed); the engine passes the value to
-// GetInterface and we compare pointers.
+void opensles_ensure_output(void);
+/* Interface-id tokens referenced by the Android library. */
 extern void *SL_IID_3DCOMMIT, *SL_IID_3DDOPPLER, *SL_IID_3DGROUPING, *SL_IID_3DLOCATION;
 extern void *SL_IID_3DMACROSCOPIC, *SL_IID_3DSOURCE, *SL_IID_ANDROIDCONFIGURATION;
 extern void *SL_IID_ANDROIDEFFECT, *SL_IID_ANDROIDEFFECTCAPABILITIES, *SL_IID_ANDROIDEFFECTSEND;

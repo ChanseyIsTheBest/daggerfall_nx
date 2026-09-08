@@ -47,6 +47,10 @@ typedef struct so_module {
   int num_syms;
   char *shstrtab;
   char *dynstrtab;
+
+  /* Set by so_finalize once svcMapProcessCodeMemory has actually backed
+   * load_virtbase. so_flush_caches refuses to run before this. */
+  int finalized;
 } so_module;
 
 void hook_arm64(uintptr_t addr, uintptr_t dst);
@@ -65,7 +69,7 @@ DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char 
 // dlsym() backing: search every loaded module's exports for `name`.
 void *so_resolve_external(const char *name);
 // Walk the loaded-module list; return the module whose mapped LOAD zone
-// contains `addr`, or NULL. Used by the diagnostic backtrace to symbolicate.
+// contains `addr`, or NULL.
 so_module *so_find_module_by_addr(const void *addr);
 int so_dump_maps(char *buf, size_t cap);
 void so_finalize(so_module *mod);

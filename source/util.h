@@ -11,15 +11,6 @@
 
 #include <stdint.h>
 
-int debugPrintf(char *text, ...);
-
-void cpu_boost(int on);
-
-// libff4.so reads its stack-protector canary from tpidr_el0 + 0x28.
-
-int ret0(void);
-int retm1(void);
-
 /* Point TPIDR_EL0 at a zeroed per-thread block so the engine's stack-protector
  * prologues (which read the canary from TPIDR_EL0+0x28) have a valid, stable
  * bionic TLS. `buf` must outlive the thread. libnx keeps its own thread state in
@@ -42,5 +33,9 @@ static inline void armSetTlsRw(void *addr) {
 static inline uint64_t umin(uint64_t a, uint64_t b) {
   return (a < b) ? a : b;
 }
+
+/* Printf-style console note. Defined in sj_glue.c; opensles.c and mp3_decode.c
+ * log through it. */
+int debugLogNote(const char *text, ...) __attribute__((format(printf, 1, 2)));
 
 #endif
