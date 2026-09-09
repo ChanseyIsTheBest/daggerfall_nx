@@ -20,8 +20,8 @@ sdmc:/switch/daggerfall_nx
 ├── libunity.so
 ├── libil2cpp.so
 ├── lib_burst_generated.so
+├── arena2/                                <- Daggerfall's game data, 1680 files (don't put this inside assets folder)
 ├── assets/                                <- the APK's assets/ folder, ENTIRE
-.└── arena2/                                <- Daggerfall's game data, 1680 files
 ```
  
 Launch from hbmenu, or by **title override** (hold R while starting an installed
